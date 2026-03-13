@@ -19,6 +19,8 @@ from fastapi.responses import HTMLResponse, Response
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 YAHOO_CHART_URL  = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+HOUSE_URL        = "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json"
+SENATE_URL       = "https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json"
 HEADERS          = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -338,6 +340,96 @@ def _compute_chart_data(sym):
     }
 
 
+# ── Congressional Trading Data ───────────────────────────────────────────────────
+_AMOUNT_RANK = {
+    "$1,001 - $15,000": 1,      "$15,001 - $50,000": 2,
+    "$50,001 - $100,000": 3,    "$100,001 - $250,000": 4,
+    "$250,001 - $500,000": 5,   "$500,001 - $1,000,000": 6,
+    "$1,000,001 - $5,000,000": 7, "over $5,000,000": 8,
+}
+
+_congress_cache = {"data": [], "fetched": 0.0}
+CONGRESS_TTL    = 3600  # re-fetch every hour
+
+
+def _norm_date(s):
+    """Normalise MM/DD/YYYY or YYYY-MM-DD to YYYY-MM-DD for sorting."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    if "/" in s:
+        try:
+            return datetime.strptime(s, "%m/%d/%Y").strftime("%Y-%m-%d")
+        except ValueError:
+            return s
+    return s
+
+
+def _fetch_congress_trades():
+    """Fetch + merge House and Senate disclosures. Returns list of dicts."""
+    rows = []
+
+    def pull_house():
+        try:
+            r = requests.get(HOUSE_URL, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            for t in r.json():
+                ticker = (t.get("ticker") or "").strip().upper()
+                if not ticker or ticker in ("--", "N/A"):
+                    continue
+                rows.append({
+                    "chamber":          "HOUSE",
+                    "name":             t.get("representative", "").strip(),
+                    "ticker":           ticker,
+                    "company":          (t.get("asset_description") or "")[:48].strip(),
+                    "trade_type":       (t.get("type") or "").strip().upper(),
+                    "amount":           t.get("amount", ""),
+                    "amount_rank":      _AMOUNT_RANK.get((t.get("amount") or "").lower().strip(), 0),
+                    "transaction_date": _norm_date(t.get("transaction_date", "")),
+                    "disclosure_date":  _norm_date(t.get("disclosure_date", "")),
+                })
+        except Exception:
+            pass
+
+    def pull_senate():
+        try:
+            r = requests.get(SENATE_URL, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            for t in r.json():
+                ticker = (t.get("ticker") or "").strip().upper()
+                if not ticker or ticker in ("--", "N/A"):
+                    continue
+                rows.append({
+                    "chamber":          "SENATE",
+                    "name":             t.get("senator", "").strip(),
+                    "ticker":           ticker,
+                    "company":          (t.get("asset_description") or "")[:48].strip(),
+                    "trade_type":       (t.get("type") or "").strip().upper(),
+                    "amount":           t.get("amount", ""),
+                    "amount_rank":      _AMOUNT_RANK.get((t.get("amount") or "").lower().strip(), 0),
+                    "transaction_date": _norm_date(t.get("transaction_date", "")),
+                    "disclosure_date":  _norm_date(t.get("disclosure_date", "")),
+                })
+        except Exception:
+            pass
+
+    t1 = threading.Thread(target=pull_house)
+    t2 = threading.Thread(target=pull_senate)
+    t1.start(); t2.start()
+    t1.join();  t2.join()
+
+    rows.sort(key=lambda x: x["transaction_date"], reverse=True)
+    return rows
+
+
+def _get_congress(force=False):
+    now = time.time()
+    if force or now - _congress_cache["fetched"] > CONGRESS_TTL or not _congress_cache["data"]:
+        _congress_cache["data"]   = _fetch_congress_trades()
+        _congress_cache["fetched"] = now
+    return _congress_cache["data"]
+
+
 # ── JSON helper ──────────────────────────────────────────────────────────────────
 class _NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -428,6 +520,41 @@ async def chart_page(symbol: str):
     return CHART_HTML
 
 
+@app.get("/api/portfolios")
+async def api_portfolios(
+    chamber: str = Query("ALL"),
+    ttype:   str = Query("ALL"),
+    sort:    str = Query("date"),
+    dir:     str = Query("desc"),
+    q:       str = Query(""),
+):
+    rows = _get_congress()
+    if chamber != "ALL": rows = [r for r in rows if r["chamber"] == chamber]
+    if ttype   != "ALL": rows = [r for r in rows if ttype in r["trade_type"]]
+    if q:
+        qu = q.upper()
+        rows = [r for r in rows if qu in r["ticker"]
+                                or qu in r["name"].upper()
+                                or qu in r["company"].upper()]
+    rev = (dir == "desc")
+    if   sort == "amount": rows = sorted(rows, key=lambda r: r["amount_rank"],      reverse=rev)
+    elif sort == "name":   rows = sorted(rows, key=lambda r: r["name"],             reverse=rev)
+    elif sort == "ticker": rows = sorted(rows, key=lambda r: r["ticker"],           reverse=rev)
+    else:                  rows = sorted(rows, key=lambda r: r["transaction_date"], reverse=rev)
+    return _json({"trades": rows[:1000], "total": len(rows)})
+
+
+@app.post("/api/portfolios/refresh")
+async def api_portfolios_refresh():
+    threading.Thread(target=_get_congress, kwargs={"force": True}, daemon=True).start()
+    return _json({"ok": True})
+
+
+@app.get("/portfolios", response_class=HTMLResponse)
+async def portfolios_page():
+    return PORTFOLIOS_HTML
+
+
 # ── HTML page ────────────────────────────────────────────────────────────────────
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -451,6 +578,11 @@ body{
   font-size:13px;padding:12px 14px;
   display:flex;flex-direction:column;gap:0;
 }
+/* ── Nav ── */
+.nav{display:flex;gap:0;margin-bottom:6px;border-bottom:1px solid var(--border);flex-shrink:0}
+.nav a{color:var(--muted);text-decoration:none;padding:4px 14px;font-size:12px;letter-spacing:.6px;border-bottom:2px solid transparent;margin-bottom:-1px}
+.nav a:hover{color:var(--amber)}
+.nav a.active{color:var(--abright);border-bottom-color:var(--abright)}
 /* ── Header ── */
 .hdr{display:flex;align-items:baseline;gap:20px;margin-bottom:3px}
 .title{color:var(--abright);font-size:19px;font-weight:bold;letter-spacing:.5px}
@@ -527,6 +659,7 @@ tbody tr:hover{background:#0d1535}
 <body>
 
 <div class="hdr">
+  <div class="nav"><a href="/" class="active">SCREENER</a><a href="/portfolios">PORTFOLIOS</a></div>
   <span class="title">&#9672; MOWAD INTELLIGENCE TERMINAL</span>
   <span class="subtitle">MULTI-FACTOR STOCK SCORING ENGINE</span>
   <span class="clock" id="clock"></span>
@@ -953,6 +1086,220 @@ load();
 </html>"""
 
 
+# ── Portfolios page ──────────────────────────────────────────────────────────────
+PORTFOLIOS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Government Portfolios</title>
+<style>
+:root{
+  --bg:#02020c;--bg-row:#04061414;--bg-alt:#080b1b;
+  --hdr:#000212;--amber:#ffa000;--abright:#ffd23c;--adim:#825200;
+  --white:#e1e1ee;--muted:#4e536c;--green:#00e15f;--red:#ff3737;
+  --yellow:#ffd71e;--cyan:#37c3ff;--border:#162a50;
+  --btn:#0a193c;--btnhov:#142d64;--btnact:#234696;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{background:var(--bg);color:var(--white);
+  font-family:Consolas,'Lucida Console','Courier New',monospace;
+  font-size:13px;padding:12px 14px;display:flex;flex-direction:column}
+.nav{display:flex;gap:0;margin-bottom:6px;border-bottom:1px solid var(--border);flex-shrink:0}
+.nav a{color:var(--muted);text-decoration:none;padding:4px 14px;font-size:12px;letter-spacing:.6px;border-bottom:2px solid transparent;margin-bottom:-1px}
+.nav a:hover{color:var(--amber)}
+.nav a.active{color:var(--abright);border-bottom-color:var(--abright)}
+.hdr{display:flex;align-items:baseline;gap:20px;margin-bottom:3px}
+.title{color:var(--abright);font-size:19px;font-weight:bold;letter-spacing:.5px}
+.subtitle{color:var(--adim);font-size:12px}
+.clock{color:var(--muted);margin-left:auto;font-size:12px}
+.tagline{color:var(--adim);font-size:11px;margin-bottom:6px}
+hr{border:none;border-top:1px solid var(--border);margin:5px 0}
+.controls{display:flex;align-items:center;flex-wrap:wrap;gap:3px;padding:5px 0}
+.clabel{color:var(--muted);font-size:12px;margin:0 3px 0 8px}
+.clabel:first-child{margin-left:0}
+.sp{width:10px;display:inline-block}
+button{background:var(--btn);color:var(--white);border:1px solid var(--border);
+  padding:3px 9px;cursor:pointer;font-family:inherit;font-size:12px;height:24px}
+button:hover{background:var(--btnhov)}
+button.active{background:var(--btnact);border-color:var(--adim);color:var(--abright)}
+#search{background:#080c20;color:var(--white);border:1px solid var(--border);
+  padding:3px 8px;font-family:inherit;font-size:12px;width:160px;height:24px}
+#search::placeholder{color:var(--muted)}
+#search:focus{outline:1px solid var(--adim)}
+#lbl-status{color:var(--amber);font-size:12px;margin-left:8px}
+.tbl-wrap{flex:1;overflow:auto;border:1px solid var(--border);min-height:0}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+thead tr{background:var(--hdr);position:sticky;top:0;z-index:5}
+th{color:var(--adim);text-align:left;padding:6px 8px;
+  border-right:1px solid var(--border);border-bottom:2px solid var(--border);
+  font-weight:normal;white-space:nowrap;font-size:12px}
+th.sortable{cursor:pointer}
+th.sortable:hover{color:var(--amber)}
+th.sort-active{color:var(--abright)}
+td{padding:4px 8px;border-right:1px solid #0d1830;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+tbody tr:nth-child(odd){background:var(--bg-row)}
+tbody tr:nth-child(even){background:var(--bg-alt)}
+tbody tr:hover{background:#0d1535}
+.cn{width:44px}.cc{width:170px}.ch{width:70px}
+.ct{width:76px}.co{width:220px}.ctp{width:90px}
+.cam{width:170px}.cd{width:96px}
+.mc{color:var(--muted)}.nc{color:var(--white)}.tc{color:var(--abright)}
+.hc{color:var(--cyan)}.sc{color:var(--adim)}.dc{color:var(--muted)}
+.buy{color:var(--green);font-weight:bold}
+.sell{color:var(--red);font-weight:bold}
+.exch{color:var(--yellow)}
+.sbar{display:flex;align-items:center;gap:20px;font-size:11px;padding:4px 0}
+#lbl-count{color:var(--adim)}
+#lbl-updated{color:var(--muted)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:#1e3258;border-radius:2px}
+</style>
+</head>
+<body>
+<div class="nav">
+  <a href="/">SCREENER</a>
+  <a href="/portfolios" class="active">PORTFOLIOS</a>
+</div>
+<div class="hdr">
+  <span class="title">&#9672; GOVERNMENT PORTFOLIOS</span>
+  <span class="subtitle">CONGRESSIONAL STOCK DISCLOSURES</span>
+  <span class="clock" id="clock"></span>
+</div>
+<div class="tagline">&nbsp;&nbsp;STOCK Act Disclosures &middot; House &amp; Senate &middot; Source: House/Senate Stock Watcher</div>
+<hr>
+<div class="controls">
+  <span class="clabel">CHAMBER:</span>
+  <button class="active" data-group="chamber" data-val="ALL"    onclick="setFilter(this)"> ALL </button>
+  <button               data-group="chamber" data-val="HOUSE"  onclick="setFilter(this)"> HOUSE </button>
+  <button               data-group="chamber" data-val="SENATE" onclick="setFilter(this)"> SENATE </button>
+
+  <span class="sp"></span>
+  <span class="clabel">TYPE:</span>
+  <button class="active" data-group="type" data-val="ALL"      onclick="setFilter(this)"> ALL </button>
+  <button               data-group="type" data-val="PURCHASE" onclick="setFilter(this)"> PURCHASE </button>
+  <button               data-group="type" data-val="SALE"      onclick="setFilter(this)"> SALE </button>
+  <button               data-group="type" data-val="EXCHANGE"  onclick="setFilter(this)"> EXCHANGE </button>
+
+  <span class="sp"></span>
+  <span class="clabel">SORT:</span>
+  <button data-sort="date"   onclick="setSort(this)"> DATE </button>
+  <button data-sort="amount" onclick="setSort(this)"> AMOUNT </button>
+  <button data-sort="name"   onclick="setSort(this)"> NAME </button>
+  <button data-sort="ticker" onclick="setSort(this)"> TICKER </button>
+
+  <span class="sp"></span>
+  <span class="clabel">SEARCH:</span>
+  <input id="search" type="text" placeholder="name, ticker, company" oninput="debounceSearch()">
+
+  <span class="sp"></span>
+  <button onclick="doRefresh()"> REFRESH </button>
+  <span id="lbl-status"></span>
+</div>
+<hr>
+
+<div class="tbl-wrap">
+  <table id="data-table">
+    <thead><tr>
+      <th class="cn">#</th>
+      <th class="cc sortable" data-sort="name"   onclick="thSort(this)">CONGRESSMAN</th>
+      <th class="ch">CHAMBER</th>
+      <th class="ct sortable" data-sort="ticker" onclick="thSort(this)">TICKER</th>
+      <th class="co">COMPANY</th>
+      <th class="ctp">TYPE</th>
+      <th class="cam sortable" data-sort="amount" onclick="thSort(this)">AMOUNT</th>
+      <th class="cd sortable sort-active" data-sort="date" onclick="thSort(this)">DATE &#9660;</th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+<hr>
+<div class="sbar">
+  <span id="lbl-count"></span>
+  <span id="lbl-updated"></span>
+</div>
+
+<script>
+const S={chamber:'ALL',ttype:'ALL',sortKey:'date',sortDir:'desc',search:''};
+let searchTimer=null;
+
+function tick(){const n=new Date();document.getElementById('clock').textContent=n.toTimeString().slice(0,8);}
+setInterval(tick,1000);tick();
+
+function setFilter(btn){
+  const g=btn.dataset.group,v=btn.dataset.val;
+  document.querySelectorAll(`[data-group="${g}"]`).forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  if(g==='chamber') S.chamber=v;
+  if(g==='type')    S.ttype=v;
+  fetchAndRender();
+}
+
+function setSort(btn){
+  const k=btn.dataset.sort;
+  if(S.sortKey===k) S.sortDir=S.sortDir==='desc'?'asc':'desc';
+  else{S.sortKey=k;S.sortDir=k==='date'?'desc':'asc';}
+  fetchAndRender();
+}
+
+function thSort(th){setSort({dataset:{sort:th.dataset.sort}});}
+
+function debounceSearch(){
+  clearTimeout(searchTimer);
+  searchTimer=setTimeout(()=>{S.search=document.getElementById('search').value;fetchAndRender();},300);
+}
+
+function typeCls(t){
+  if(!t) return '';
+  if(t.includes('PURCHASE')) return 'buy';
+  if(t.includes('SALE'))     return 'sell';
+  return 'exch';
+}
+
+async function fetchAndRender(){
+  const p=new URLSearchParams({chamber:S.chamber,ttype:S.ttype,sort:S.sortKey,dir:S.sortDir,q:S.search});
+  const r=await fetch('/api/portfolios?'+p);
+  const d=await r.json();
+  renderTable(d.trades, d.total);
+}
+
+function renderTable(rows, total){
+  document.getElementById('lbl-count').textContent=`  Showing ${rows.length} of ${total} disclosures`;
+  const tbody=document.getElementById('tbody');
+  if(!rows.length){
+    tbody.innerHTML='<tr><td colspan="8" style="color:var(--muted);padding:20px">  No records match the current filters.</td></tr>';
+    return;
+  }
+  tbody.innerHTML=rows.map((r,i)=>`<tr>
+    <td class="cn mc">&nbsp;${i+1}</td>
+    <td class="cc nc">&nbsp;${r.name}</td>
+    <td class="ch hc">&nbsp;${r.chamber}</td>
+    <td class="ct tc">&nbsp;${r.ticker}</td>
+    <td class="co nc">&nbsp;${r.company}</td>
+    <td class="ctp ${typeCls(r.trade_type)}">&nbsp;${r.trade_type}</td>
+    <td class="cam sc">&nbsp;${r.amount}</td>
+    <td class="cd dc">&nbsp;${r.transaction_date}</td>
+  </tr>`).join('');
+}
+
+async function doRefresh(){
+  document.getElementById('lbl-status').textContent='  REFRESHING...';
+  document.getElementById('lbl-status').style.color='var(--amber)';
+  await fetch('/api/portfolios/refresh',{method:'POST'});
+  await fetchAndRender();
+  document.getElementById('lbl-status').textContent='  READY';
+  document.getElementById('lbl-status').style.color='var(--green)';
+  document.getElementById('lbl-updated').textContent='  Updated: '+new Date().toTimeString().slice(0,8);
+}
+
+fetchAndRender();
+</script>
+</body>
+</html>"""
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML_PAGE
@@ -961,3 +1308,4 @@ async def index():
 if __name__ == "__main__":
     trigger_refresh()
     uvicorn.run(app, host="127.0.0.1", port=8888, log_level="warning")
+###Stop-Process -Id (Get-NetTCPConnection -LocalPort 8888).OwningProcess -Force
