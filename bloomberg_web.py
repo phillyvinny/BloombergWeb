@@ -505,8 +505,6 @@ tbody tr:hover{background:#0d1535}
 .sh{color:var(--green)}   .sm{color:var(--yellow)}    .sl{color:var(--red)}
 .ic{color:var(--adim)}
 /* ── Clickable MACD cell ── */
-.macd-cell{cursor:pointer}
-.macd-cell:hover{background:#122040 !important;color:#a0e8ff !important}
 .ticker-cell{cursor:pointer}
 .ticker-cell:hover{color:#ffffff !important;text-decoration:underline}
 /* ── Status bar ── */
@@ -688,10 +686,10 @@ function renderTable(rows, totalLoaded){
     return `<tr>
       <td class="c0 mc">&nbsp;${i+1}</td>
       <td class="c1 tc ticker-cell" onclick="openChart('${s.symbol}')" title="Click to open chart">&nbsp;${s.symbol}</td>
-      <td class="c2 nc">&nbsp;${s.name}</td>
+      <td class="c2 nc ticker-cell" onclick="openChart('${s.symbol}')" title="Click to open chart">&nbsp;${s.name}</td>
       <td class="c3 pc">$${fmt(s.price)}&nbsp;</td>
       <td class="c4 bc">${s.bar_ema}&nbsp;${String(s.ema_s).padStart(2)}/20</td>
-      <td class="c5 bc macd-cell" onclick="openChart('${s.symbol}')" title="Click to open MACD chart">${s.bar_macd}&nbsp;${String(s.macd_s).padStart(2)}/20</td>
+      <td class="c5 bc">${s.bar_macd}&nbsp;${String(s.macd_s).padStart(2)}/20</td>
       <td class="c6 bc">${s.bar_rsi}&nbsp;${String(s.rsi_s).padStart(2)}/20</td>
       <td class="c7 bc">${s.bar_trend}&nbsp;${String(s.trend_s).padStart(2)}/20</td>
       <td class="c8 ${am!=null?'bc':'mc'}">${aBars}</td>
