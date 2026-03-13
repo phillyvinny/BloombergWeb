@@ -269,46 +269,71 @@ def trigger_refresh():
 
 # ── MACD Chart Data ──────────────────────────────────────────────────────────────
 def _compute_chart_data(sym):
-    """Fetch 6 months of daily data and return full MACD series for charting."""
+    """Fetch 6 months of OHLCV data and return full indicator series for charting."""
     r = requests.get(
         YAHOO_CHART_URL.format(symbol=sym),
         params={"interval": "1d", "range": "6mo"},
         headers=HEADERS, timeout=15,
     )
     r.raise_for_status()
-    result = r.json()["chart"]["result"][0]
-    meta   = result["meta"]
+    result     = r.json()["chart"]["result"][0]
+    meta       = result["meta"]
     timestamps = result.get("timestamp", [])
     quote      = result["indicators"]["quote"][0]
-    closes_raw = quote.get("close", [])
+    opens_raw  = quote.get("open",   [])
+    highs_raw  = quote.get("high",   [])
+    lows_raw   = quote.get("low",    [])
+    closes_raw = quote.get("close",  [])
+    vols_raw   = quote.get("volume", [])
 
-    pairs = [(t, c) for t, c in zip(timestamps, closes_raw) if c is not None]
-    if len(pairs) < 35:
+    rows = []
+    for t, o, h, l, c, v in zip(timestamps, opens_raw, highs_raw, lows_raw, closes_raw, vols_raw):
+        if any(x is None for x in [o, h, l, c]):
+            continue
+        date = datetime.utcfromtimestamp(t).strftime("%Y-%m-%d")
+        rows.append((date, float(o), float(h), float(l), float(c), int(v or 0)))
+
+    if len(rows) < 35:
         return None
 
-    dates  = [datetime.fromtimestamp(t).strftime("%b %d") for t, _ in pairs]
-    closes = [float(c) for _, c in pairs]
+    dates  = [r[0] for r in rows]
+    closes = [r[4] for r in rows]
 
-    ema12 = _ema(closes, 12)
-    ema26 = _ema(closes, 26)
-    macd  = [a - b for a, b in zip(ema12, ema26)]
-    sig   = _ema(macd, 9)
-    hist  = [m - s for m, s in zip(macd, sig)]
+    ema20v = _ema(closes, 20)
+    ema50v = _ema(closes, min(50, len(closes)))
+    ema12  = _ema(closes, 12)
+    ema26  = _ema(closes, 26)
+    macd   = [a - b for a, b in zip(ema12, ema26)]
+    sig    = _ema(macd, 9)
+    hist   = [m - s for m, s in zip(macd, sig)]
+
+    rsi_series = []
+    for i in range(len(closes)):
+        if i < 15:
+            continue
+        rsi_series.append({"time": dates[i], "value": round(_rsi(closes[:i+1]), 2)})
 
     return {
         "symbol":     sym,
         "name":       (meta.get("longName") or meta.get("shortName") or sym),
-        "dates":      dates,
-        "prices":     [round(c, 2) for c in closes],
-        "ema12":      [round(v, 4) for v in ema12],
-        "ema26":      [round(v, 4) for v in ema26],
-        "macd":       [round(v, 4) for v in macd],
-        "signal":     [round(v, 4) for v in sig],
-        "hist":       [round(v, 4) for v in hist],
+        "price":      round(closes[-1], 2),
+        "candles":    [{"time": d, "open": o, "high": h, "low": l, "close": c}
+                       for d, o, h, l, c, v in rows],
+        "volumes":    [{"time": d, "value": v,
+                        "color": "#00e15f55" if c >= o else "#ff373755"}
+                       for d, o, h, l, c, v in rows],
+        "ema20":      [{"time": d, "value": round(v, 2)} for d, v in zip(dates, ema20v)],
+        "ema50":      [{"time": d, "value": round(v, 2)} for d, v in zip(dates, ema50v)],
+        "macd":       [{"time": d, "value": round(v, 4)} for d, v in zip(dates, macd)],
+        "signal":     [{"time": d, "value": round(v, 4)} for d, v in zip(dates, sig)],
+        "hist":       [{"time": d, "value": round(v, 4),
+                        "color": "#00e15f" if v >= 0 else "#ff3737"}
+                       for d, v in zip(dates, hist)],
+        "rsi":        rsi_series,
         "macd_val":   round(macd[-1], 4),
         "signal_val": round(sig[-1], 4),
         "hist_val":   round(hist[-1], 4),
-        "price":      round(closes[-1], 2),
+        "rsi_val":    round(_rsi(closes), 1),
         "crossover":  macd[-1] > sig[-1],
     }
 
@@ -482,6 +507,8 @@ tbody tr:hover{background:#0d1535}
 /* ── Clickable MACD cell ── */
 .macd-cell{cursor:pointer}
 .macd-cell:hover{background:#122040 !important;color:#a0e8ff !important}
+.ticker-cell{cursor:pointer}
+.ticker-cell:hover{color:#ffffff !important;text-decoration:underline}
 /* ── Status bar ── */
 .sbar{display:flex;align-items:center;gap:20px;font-size:11px;padding:4px 0}
 .sp2{color:var(--amber)}
@@ -660,7 +687,7 @@ function renderTable(rows, totalLoaded){
                         :`${s.bar_analyst}&nbsp;&nbsp;N/A`;
     return `<tr>
       <td class="c0 mc">&nbsp;${i+1}</td>
-      <td class="c1 tc">&nbsp;${s.symbol}</td>
+      <td class="c1 tc ticker-cell" onclick="openChart('${s.symbol}')" title="Click to open chart">&nbsp;${s.symbol}</td>
       <td class="c2 nc">&nbsp;${s.name}</td>
       <td class="c3 pc">$${fmt(s.price)}&nbsp;</td>
       <td class="c4 bc">${s.bar_ema}&nbsp;${String(s.ema_s).padStart(2)}/20</td>
@@ -711,8 +738,8 @@ async function pollStatus(){
 
 // ── Manual refresh ─────────────────────────────────────────────────────────────
 function openChart(symbol){
-  window.open('/chart/'+symbol,'macd_'+symbol,
-    'width=1060,height=720,resizable=yes,scrollbars=no,menubar=no,toolbar=no');
+  window.open('/chart/'+symbol,'chart_'+symbol,
+    'width=1120,height=860,resizable=yes,scrollbars=no,menubar=no,toolbar=no');
 }
 
 async function manualRefresh(){
@@ -734,44 +761,40 @@ CHART_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>MACD Chart</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<title>Chart</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 :root{
-  --bg:#02020c;--hdr:#000212;--amber:#ffa000;--abright:#ffd23c;--adim:#825200;
+  --bg:#02020c;--amber:#ffa000;--abright:#ffd23c;--adim:#825200;
   --white:#e1e1ee;--muted:#4e536c;--green:#00e15f;--red:#ff3737;
   --yellow:#ffd71e;--cyan:#37c3ff;--border:#162a50;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;background:var(--bg);color:var(--white);
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--white);
   font-family:Consolas,'Lucida Console','Courier New',monospace;font-size:13px}
-body{display:flex;flex-direction:column;padding:12px 16px;gap:0}
-.hdr{display:flex;align-items:baseline;gap:16px;margin-bottom:6px}
+body{display:flex;flex-direction:column;padding:10px 14px}
+.hdr{display:flex;align-items:baseline;gap:14px;margin-bottom:4px;flex-shrink:0}
 .sym{color:var(--abright);font-size:20px;font-weight:bold}
-.nm{color:var(--adim);font-size:13px}
+.nm{color:var(--adim)}
 .price{color:var(--amber);margin-left:auto;font-size:15px}
-hr{border:none;border-top:1px solid var(--border);margin:5px 0}
-/* stats strip */
-.stats{display:flex;gap:28px;padding:7px 2px;font-size:12px}
-.stat-lbl{color:var(--muted)}
-.stat-val{font-size:14px;font-weight:bold}
+hr{border:none;border-top:1px solid var(--border);margin:4px 0;flex-shrink:0}
+.stats{display:flex;gap:22px;padding:4px 2px;flex-shrink:0}
+.stat-lbl{color:var(--muted);font-size:10px}
+.stat-val{font-size:13px;font-weight:bold}
 .pos{color:var(--green)}.neg{color:var(--red)}.neu{color:var(--yellow)}
-/* chart containers */
-.charts{flex:1;display:flex;flex-direction:column;gap:6px;min-height:0}
-.chart-box{position:relative;background:#04060f;border:1px solid var(--border);border-radius:2px}
-.chart-label{position:absolute;top:6px;left:10px;font-size:11px;color:var(--adim);z-index:1;pointer-events:none}
-#price-box{flex:1.2}
-#macd-box{flex:1}
-canvas{display:block}
-/* loading */
-#loading{display:flex;align-items:center;justify-content:center;
-  position:absolute;inset:0;background:var(--bg);color:var(--amber);font-size:14px;z-index:10}
-#err{display:none;color:var(--red);padding:20px}
+/* chart panels */
+.charts{flex:1;display:flex;flex-direction:column;gap:3px;min-height:0}
+.cpanel{position:relative;background:#030510;border:1px solid var(--border)}
+#pw{flex:0 0 52%}
+#mw{flex:0 0 26%}
+#rw{flex:1}
+.clbl{position:absolute;top:5px;left:9px;font-size:10px;color:var(--muted);z-index:5;pointer-events:none;letter-spacing:.4px}
+#loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+  background:var(--bg);color:var(--amber);font-size:14px;z-index:100}
 </style>
 </head>
 <body>
-<div id="loading">Loading chart data&hellip;</div>
-
+<div id="loading">Loading&hellip;</div>
 <div class="hdr">
   <span class="sym" id="sym"></span>
   <span class="nm"  id="nm"></span>
@@ -779,204 +802,151 @@ canvas{display:block}
 </div>
 <hr>
 <div class="stats">
-  <div>
-    <div class="stat-lbl">MACD</div>
-    <div class="stat-val" id="s-macd"></div>
-  </div>
-  <div>
-    <div class="stat-lbl">SIGNAL</div>
-    <div class="stat-val" id="s-sig"></div>
-  </div>
-  <div>
-    <div class="stat-lbl">HISTOGRAM</div>
-    <div class="stat-val" id="s-hist"></div>
-  </div>
-  <div>
-    <div class="stat-lbl">CROSSOVER</div>
-    <div class="stat-val" id="s-cross"></div>
-  </div>
+  <div><div class="stat-lbl">RSI (14)</div><div class="stat-val" id="s-rsi"></div></div>
+  <div><div class="stat-lbl">MACD</div><div class="stat-val" id="s-macd"></div></div>
+  <div><div class="stat-lbl">SIGNAL</div><div class="stat-val" id="s-sig"></div></div>
+  <div><div class="stat-lbl">HISTOGRAM</div><div class="stat-val" id="s-hist"></div></div>
+  <div><div class="stat-lbl">CROSSOVER</div><div class="stat-val" id="s-cross"></div></div>
 </div>
 <hr>
 <div class="charts">
-  <div class="chart-box" id="price-box">
-    <span class="chart-label">PRICE &nbsp;&#x2014;&nbsp; EMA12 &nbsp;&#x2014;&nbsp; EMA26</span>
-    <canvas id="price-chart"></canvas>
-  </div>
-  <div class="chart-box" id="macd-box">
-    <span class="chart-label">MACD &nbsp;&#x2014;&nbsp; SIGNAL &nbsp;&#x2014;&nbsp; HISTOGRAM</span>
-    <canvas id="macd-chart"></canvas>
-  </div>
+  <div class="cpanel" id="pw"><span class="clbl">CANDLESTICK &nbsp;&#x2500;&nbsp; EMA 20 &nbsp;&#x2500;&nbsp; EMA 50 &nbsp;&#x2500;&nbsp; VOLUME</span><div id="pc" style="height:100%"></div></div>
+  <div class="cpanel" id="mw"><span class="clbl">MACD &nbsp;&#x2500;&nbsp; SIGNAL &nbsp;&#x2500;&nbsp; HISTOGRAM</span><div id="mc" style="height:100%"></div></div>
+  <div class="cpanel" id="rw"><span class="clbl">RSI (14)</span><div id="rc" style="height:100%"></div></div>
 </div>
-<div id="err"></div>
 
 <script>
-const SYMBOL = window.location.pathname.split('/').pop().toUpperCase();
-document.title = 'MACD \u2014 ' + SYMBOL;
+const SYM = window.location.pathname.split('/').pop().toUpperCase();
+document.title = SYM + ' \u2014 Chart';
 
-const GRID   = 'rgba(22,42,80,0.6)';
-const TICK   = '#4e536c';
-const TOOLTIP_BG = '#050a1e';
+const CLR = {
+  bg:'#02020c', border:'#162a50', text:'#9ba3c0',
+  amber:'#ffa000', abright:'#ffd23c',
+  green:'#00e15f', red:'#ff3737', cyan:'#37c3ff', muted:'#4e536c'
+};
 
-function baseScaleOpts(type='linear'){
-  return {
-    type,
-    grid:{color:GRID},
-    ticks:{color:TICK,maxRotation:0,autoSkipPadding:12},
-    border:{color:GRID}
-  };
+function mkChart(el){
+  return LightweightCharts.createChart(el, {
+    width: el.clientWidth, height: el.clientHeight,
+    layout:{background:{type:LightweightCharts.ColorType.Solid,color:CLR.bg},
+            textColor:CLR.text,fontFamily:"Consolas,'Lucida Console',monospace",fontSize:11},
+    grid:{vertLines:{color:CLR.border},horzLines:{color:CLR.border}},
+    crosshair:{mode:LightweightCharts.CrosshairMode.Normal},
+    timeScale:{borderColor:CLR.border,timeVisible:true,secondsVisible:false,rightOffset:4},
+    rightPriceScale:{borderColor:CLR.border},
+  });
 }
 
-function basePlugins(legend=true){
-  return {
-    legend: legend
-      ? {labels:{color:'#9ba3c0',font:{size:11},boxWidth:20,padding:12}}
-      : {display:false},
-    tooltip:{
-      backgroundColor:TOOLTIP_BG,titleColor:'#ffd23c',
-      bodyColor:'#c0c8e8',borderColor:'#162a50',borderWidth:1
-    }
-  };
+// Sync time scales across all charts
+let _syncing = false;
+function syncTS(charts){
+  charts.forEach(src=>{
+    src.timeScale().subscribeVisibleLogicalRangeChange(r=>{
+      if(_syncing||!r) return;
+      _syncing=true;
+      charts.forEach(d=>{ if(d!==src) d.timeScale().setVisibleLogicalRange(r); });
+      _syncing=false;
+    });
+  });
+}
+
+// Sync crosshairs
+function syncXH(pairs){
+  pairs.forEach(([sc,ss])=>{
+    sc.subscribeCrosshairMove(p=>{
+      pairs.forEach(([dc,ds])=>{
+        if(dc===sc) return;
+        if(p.time){
+          const v=p.seriesData.get(ss);
+          dc.setCrosshairPosition(v?(v.close??v.value??0):0, p.time, ds);
+        } else { dc.clearCrosshairPosition(); }
+      });
+    });
+  });
 }
 
 async function load(){
-  const r = await fetch('/api/chart/'+SYMBOL);
+  const r = await fetch('/api/chart/'+SYM);
   const d = await r.json();
-  if(d.error){
-    document.getElementById('err').style.display='block';
-    document.getElementById('err').textContent='Error: '+d.error;
-    document.getElementById('loading').style.display='none';
-    return;
-  }
+  if(d.error){ document.getElementById('loading').textContent='Error: '+d.error; return; }
 
-  // populate header & stats
+  // Header
   document.getElementById('sym').textContent   = d.symbol;
-  document.getElementById('nm').textContent    = d.name;
+  document.getElementById('nm').textContent    = '\u00a0\u00a0'+d.name;
   document.getElementById('price').textContent = '$'+d.price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
 
-  const posNeg = v => v > 0 ? 'pos' : v < 0 ? 'neg' : 'neu';
-  const fmt4   = v => (v >= 0 ? '+' : '') + v.toFixed(4);
+  const pn = v=>v>0?'pos':v<0?'neg':'neu';
+  const f4 = v=>(v>=0?'+':'')+v.toFixed(4);
+  const rsiCls = v=>v>=70?'neg':v<=30?'pos':'neu';
 
-  document.getElementById('s-macd').textContent  = fmt4(d.macd_val);
-  document.getElementById('s-macd').className    = 'stat-val ' + posNeg(d.macd_val);
-  document.getElementById('s-sig').textContent   = fmt4(d.signal_val);
-  document.getElementById('s-sig').className     = 'stat-val ' + posNeg(d.signal_val);
-  document.getElementById('s-hist').textContent  = fmt4(d.hist_val);
-  document.getElementById('s-hist').className    = 'stat-val ' + posNeg(d.hist_val);
-  document.getElementById('s-cross').textContent = d.crossover ? 'BULLISH \u25b2' : 'BEARISH \u25bc';
-  document.getElementById('s-cross').className   = 'stat-val ' + (d.crossover ? 'pos' : 'neg');
+  document.getElementById('s-rsi').textContent  = d.rsi_val.toFixed(1);
+  document.getElementById('s-rsi').className    = 'stat-val '+rsiCls(d.rsi_val);
+  document.getElementById('s-macd').textContent = f4(d.macd_val);
+  document.getElementById('s-macd').className   = 'stat-val '+pn(d.macd_val);
+  document.getElementById('s-sig').textContent  = f4(d.signal_val);
+  document.getElementById('s-sig').className    = 'stat-val '+pn(d.signal_val);
+  document.getElementById('s-hist').textContent = f4(d.hist_val);
+  document.getElementById('s-hist').className   = 'stat-val '+pn(d.hist_val);
+  document.getElementById('s-cross').textContent= d.crossover?'BULLISH \u25b2':'BEARISH \u25bc';
+  document.getElementById('s-cross').className  = 'stat-val '+(d.crossover?'pos':'neg');
 
-  // size canvases to fill containers
-  const priceBox = document.getElementById('price-box');
-  const macdBox  = document.getElementById('macd-box');
+  // ── Price chart ─────────────────────────────────────────────────────────────
+  const pcEl = document.getElementById('pc');
+  const pc   = mkChart(pcEl);
 
-  // ── Price chart ───────────────────────────────────────────────────────────
-  const pc = document.getElementById('price-chart');
-  new Chart(pc, {
-    type: 'line',
-    data: {
-      labels: d.dates,
-      datasets: [
-        {
-          label: 'Price',
-          data: d.prices,
-          borderColor: '#ffa000',
-          borderWidth: 1.8,
-          pointRadius: 0,
-          tension: 0.15,
-          fill: false,
-          order: 1,
-        },
-        {
-          label: 'EMA 12',
-          data: d.ema12,
-          borderColor: '#37c3ff',
-          borderWidth: 1.2,
-          pointRadius: 0,
-          borderDash: [],
-          tension: 0.15,
-          fill: false,
-          order: 2,
-        },
-        {
-          label: 'EMA 26',
-          data: d.ema26,
-          borderColor: '#ffd23c',
-          borderWidth: 1.2,
-          pointRadius: 0,
-          borderDash: [4,3],
-          tension: 0.15,
-          fill: false,
-          order: 3,
-        },
-      ]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      plugins: basePlugins(true),
-      scales: {
-        x: {...baseScaleOpts('category'), ticks:{...baseScaleOpts('category').ticks, maxTicksLimit:12}},
-        y: {...baseScaleOpts(), position:'right',
-          ticks:{...baseScaleOpts().ticks, callback: v=>'$'+v.toLocaleString()}}
-      }
-    }
+  const candles = pc.addCandlestickSeries({
+    upColor:'#00e15f', downColor:'#ff3737',
+    borderUpColor:'#00e15f', borderDownColor:'#ff3737',
+    wickUpColor:'#00e15f', wickDownColor:'#ff3737',
   });
+  candles.setData(d.candles);
 
-  // ── MACD chart ────────────────────────────────────────────────────────────
-  const histColors = d.hist.map(v => v >= 0 ? 'rgba(0,225,95,0.75)' : 'rgba(255,55,55,0.75)');
-  const mc = document.getElementById('macd-chart');
-  new Chart(mc, {
-    data: {
-      labels: d.dates,
-      datasets: [
-        {
-          type: 'bar',
-          label: 'Histogram',
-          data: d.hist,
-          backgroundColor: histColors,
-          borderWidth: 0,
-          order: 3,
-        },
-        {
-          type: 'line',
-          label: 'MACD',
-          data: d.macd,
-          borderColor: '#37c3ff',
-          borderWidth: 1.6,
-          pointRadius: 0,
-          tension: 0.1,
-          fill: false,
-          order: 1,
-        },
-        {
-          type: 'line',
-          label: 'Signal',
-          data: d.signal,
-          borderColor: '#ffd23c',
-          borderWidth: 1.4,
-          pointRadius: 0,
-          borderDash: [4,3],
-          tension: 0.1,
-          fill: false,
-          order: 2,
-        },
-      ]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      plugins: basePlugins(true),
-      scales: {
-        x: {...baseScaleOpts('category'), ticks:{...baseScaleOpts('category').ticks, maxTicksLimit:12}},
-        y: {...baseScaleOpts(), position:'right',
-          ticks:{...baseScaleOpts().ticks, callback: v=>v.toFixed(3)}}
-      }
-    }
-  });
+  const vol = pc.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'vol'});
+  pc.priceScale('vol').applyOptions({scaleMargins:{top:0.82,bottom:0}});
+  vol.setData(d.volumes);
 
-  document.getElementById('loading').style.display = 'none';
+  const e20 = pc.addLineSeries({color:CLR.cyan,   lineWidth:1.4,priceLineVisible:false,lastValueVisible:false});
+  const e50 = pc.addLineSeries({color:CLR.abright,lineWidth:1.4,priceLineVisible:false,lastValueVisible:false,
+                                 lineStyle:LightweightCharts.LineStyle.Dashed});
+  e20.setData(d.ema20);
+  e50.setData(d.ema50);
+
+  // ── MACD chart ──────────────────────────────────────────────────────────────
+  const mcEl = document.getElementById('mc');
+  const mc   = mkChart(mcEl);
+
+  const hist    = mc.addHistogramSeries({priceLineVisible:false,lastValueVisible:false});
+  const macdLn  = mc.addLineSeries({color:CLR.cyan,   lineWidth:1.5,priceLineVisible:false,lastValueVisible:true});
+  const sigLn   = mc.addLineSeries({color:CLR.abright,lineWidth:1.2,priceLineVisible:false,lastValueVisible:true,
+                                     lineStyle:LightweightCharts.LineStyle.Dashed});
+  hist.setData(d.hist);
+  macdLn.setData(d.macd);
+  sigLn.setData(d.signal);
+
+  // ── RSI chart ───────────────────────────────────────────────────────────────
+  const rcEl = document.getElementById('rc');
+  const rc   = mkChart(rcEl);
+
+  const rsiLn = rc.addLineSeries({color:CLR.cyan,lineWidth:1.5,priceLineVisible:false,lastValueVisible:true});
+  rsiLn.setData(d.rsi);
+  rsiLn.createPriceLine({price:70,color:CLR.red,  lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'OB'});
+  rsiLn.createPriceLine({price:50,color:CLR.muted,lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dotted,axisLabelVisible:false});
+  rsiLn.createPriceLine({price:30,color:CLR.green,lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'OS'});
+  rc.priceScale('right').applyOptions({autoScale:false,minimum:0,maximum:100});
+
+  // ── Sync + fit ───────────────────────────────────────────────────────────────
+  syncTS([pc, mc, rc]);
+  syncXH([[pc,candles],[mc,macdLn],[rc,rsiLn]]);
+  [pc,mc,rc].forEach(c=>c.timeScale().fitContent());
+
+  // ── Resize ───────────────────────────────────────────────────────────────────
+  new ResizeObserver(()=>{
+    pc.resize(pcEl.clientWidth, pcEl.clientHeight);
+    mc.resize(mcEl.clientWidth, mcEl.clientHeight);
+    rc.resize(rcEl.clientWidth, rcEl.clientHeight);
+  }).observe(document.getElementById('pw'));
+
+  document.getElementById('loading').style.display='none';
 }
 
 load();
