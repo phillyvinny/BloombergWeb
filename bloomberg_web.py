@@ -1,6 +1,6 @@
 """
-Bloomberg-Style Stock Intelligence Terminal — Web Edition
-FastAPI backend · Bloomberg dark UI · Auto-refresh every 5 min
+Vinny's Stock Intelligence Terminal — Web Edition
+FastAPI backend · Vinny's dark UI · Auto-refresh every 5 min
 Run:  python bloomberg_web.py   →   open http://localhost:8000
 """
 
@@ -968,7 +968,7 @@ LAUNCHPAD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Bloomberg Intelligence Terminal</title>
+<title>Vinny's Intelligence Terminal</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root{
@@ -1048,7 +1048,7 @@ canvas{width:100%!important;height:100%!important}
   <a href="/legis">LEGIS</a>
 </div>
 <div class="top-bar">
-  <span class="brand">&#9672; BLOOMBERG INTELLIGENCE TERMINAL</span>
+  <span class="brand">&#9672; VINNY'S INTELLIGENCE TERMINAL</span>
   <span class="tagline">MARKET LAUNCHPAD</span>
   <span class="clock" id="clock"></span>
 </div>
@@ -1291,7 +1291,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Bloomberg Intelligence Terminal</title>
+<title>Vinny's Intelligence Terminal</title>
 <style>
 :root{
   --bg:#02020c;--bg-row:#04061414;--bg-alt:#080b1b;
