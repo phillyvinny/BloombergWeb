@@ -745,18 +745,22 @@ NEWS_TTL    = 300
 
 
 def _fetch_quote(symbol):
-    """Fetch current price + daily change via Polygon. Handles stocks, forex (C:), crypto (X:)."""
-    if symbol.startswith("X:"):
-        raw   = _poly_get(f"{POLYGON_BASE}/v2/snapshot/locale/global/markets/crypto/tickers/{symbol}")
-        inner = raw.get("ticker", {})
-    elif symbol.startswith("C:"):
-        raw   = _poly_get(f"{POLYGON_BASE}/v2/snapshot/locale/global/markets/forex/tickers/{symbol}")
-        inner = raw.get("ticker", {})
-    else:
-        raw   = _poly_get(f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}")
-        inner = raw.get("results") or raw.get("ticker") or {}
-    price = float(inner.get("day", {}).get("c") or inner.get("lastTrade", {}).get("p") or 0)
-    prev  = float(inner.get("prevDay", {}).get("c") or price)
+    """Fetch last-close price + daily change via Polygon aggregates.
+    Using daily bars (last 2 trading days) works correctly whether the
+    market is open, closed, or it's a weekend — no snapshot zeros."""
+    today     = date.today()
+    from_date = str(today - timedelta(days=10))  # 10 cal days → at least 2 trading days
+    to_date   = str(today)
+    extra = {} if symbol.startswith(("X:", "C:")) else {"adjusted": "true"}
+    raw   = _poly_get(
+        f"{POLYGON_BASE}/v2/aggs/ticker/{symbol}/range/1/day/{from_date}/{to_date}",
+        params={"sort": "asc", "limit": 10, **extra},
+    )
+    bars  = [b for b in (raw.get("results") or []) if b.get("c") is not None]
+    if not bars:
+        return 0.0, 0.0, 0.0
+    price = float(bars[-1]["c"])
+    prev  = float(bars[-2]["c"]) if len(bars) >= 2 else price
     chg   = price - prev
     pct   = (chg / prev * 100) if prev else 0.0
     return round(price, 4), round(chg, 4), round(pct, 3)
@@ -1004,7 +1008,10 @@ async def legis_page():
 
 @app.get("/api/home")
 async def api_home():
-    return _json(_get_home())
+    d = dict(_get_home() or {})
+    d["market_open"] = _market_open()
+    d["et_time"]     = _et_now().strftime("%H:%M ET %a")
+    return _json(d)
 
 
 # ── Sector range fetch ────────────────────────────────────────────────────────────
@@ -1020,10 +1027,15 @@ def _sector_date_range(range_str):
 
 def _fetch_sector_pct(symbol, range_str):
     if range_str == "1d":
-        raw   = _poly_get(f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}")
-        data  = raw.get("results") or raw.get("ticker") or {}
-        price = float(data.get("day", {}).get("c") or 0)
-        prev  = float(data.get("prevDay", {}).get("c") or price)
+        today = date.today()
+        raw   = _poly_get(
+            f"{POLYGON_BASE}/v2/aggs/ticker/{symbol}/range/1/day"
+            f"/{today - timedelta(days=10)}/{today}",
+            params={"adjusted": "true", "sort": "asc", "limit": 10},
+        )
+        bars  = [b["c"] for b in (raw.get("results") or []) if b.get("c") is not None]
+        price = bars[-1] if bars else 0.0
+        prev  = bars[-2] if len(bars) >= 2 else price
         pct   = (price - prev) / prev * 100 if prev else 0.0
     else:
         from_date, to_date = _sector_date_range(range_str)
@@ -1165,6 +1177,9 @@ canvas{width:100%!important;height:100%!important}
       <span class="dot">&#9672;</span> MARKET MONITOR
       <span class="sub" id="mkt-updated"></span>
     </div>
+    <div id="lp-market-banner" style="display:none;background:#1a0a00;border-bottom:1px solid #f0b429;color:#f0b429;font-size:11px;padding:3px 8px;letter-spacing:.5px;">
+      &#9632; MARKET CLOSED &mdash; <span id="lp-banner-time"></span> &mdash; Last closing prices
+    </div>
     <div class="panel-body" id="mkt-body">
       <div class="loading">&nbsp; Loading market data...</div>
     </div>
@@ -1235,8 +1250,18 @@ async function loadHome(){
     renderMarket(d.indices||[]);
     renderSectors(d.sectors||[]);
     renderSignals(d.signals||[]);
-    document.getElementById('mkt-updated').textContent='Updated '+new Date().toTimeString().slice(0,8);
-    document.getElementById('sec-updated').textContent='Updated '+new Date().toTimeString().slice(0,8);
+    const ts='Updated '+new Date().toTimeString().slice(0,8);
+    document.getElementById('mkt-updated').textContent=ts;
+    document.getElementById('sec-updated').textContent=ts;
+    // Market closed banner
+    const banner=document.getElementById('lp-market-banner');
+    const bannerTime=document.getElementById('lp-banner-time');
+    if(d.market_open===false){
+      banner.style.display='block';
+      bannerTime.textContent=d.et_time||'';
+    } else {
+      banner.style.display='none';
+    }
   }catch(e){console.error(e);}
 }
 
