@@ -4,7 +4,9 @@ FastAPI backend · Bloomberg dark UI · Auto-refresh every 5 min
 Run:  python bloomberg_web.py   →   open http://localhost:8000
 """
 
+import io
 import json
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,11 +18,10 @@ import yfinance as yf
 import uvicorn
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, Response
+from pypdf import PdfReader
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 YAHOO_CHART_URL  = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-HOUSE_URL        = "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json"
-SENATE_URL       = "https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json"
 HEADERS          = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -341,6 +342,9 @@ def _compute_chart_data(sym):
 
 
 # ── Congressional Trading Data ───────────────────────────────────────────────────
+HOUSE_PTR_SEARCH = "https://disclosures-clerk.house.gov/FinancialDisclosure/ViewMemberSearchResult"
+HOUSE_PTR_BASE   = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs"
+
 _AMOUNT_RANK = {
     "$1,001 - $15,000": 1,      "$15,001 - $50,000": 2,
     "$50,001 - $100,000": 3,    "$100,001 - $250,000": 4,
@@ -349,74 +353,114 @@ _AMOUNT_RANK = {
 }
 
 _congress_cache = {"data": [], "fetched": 0.0}
-CONGRESS_TTL    = 3600  # re-fetch every hour
+CONGRESS_TTL    = 86400  # re-fetch once per day (PDFs don't change)
+
+_HDR_PAT   = re.compile(r"^(ID Owner|Cap\.|Gains|Notification|\$200|Amount Cap)")
+_OWNER_PAT = re.compile(r"^(?:SP|JT|DC|SE|DEP|OC|OP)\s+")
 
 
-def _norm_date(s):
-    """Normalise MM/DD/YYYY or YYYY-MM-DD to YYYY-MM-DD for sorting."""
-    s = (s or "").strip()
-    if not s:
-        return ""
-    if "/" in s:
-        try:
-            return datetime.strptime(s, "%m/%d/%Y").strftime("%Y-%m-%d")
-        except ValueError:
-            return s
-    return s
+def _search_house_ptrs(year):
+    """Return list of (doc_id, member_name) from the House PTR search form."""
+    try:
+        r = requests.post(
+            HOUSE_PTR_SEARCH,
+            data={"LastName": "", "FilingYear": str(year), "State": "", "District": "", "FilingType": "P"},
+            headers=HEADERS, timeout=30,
+        )
+        r.raise_for_status()
+        pairs = re.findall(
+            r'href="public_disc/ptr-pdfs/\d+/(\d+)\.pdf"[^>]*>([^<]+)</a>',
+            r.text,
+        )
+        return [(doc_id, name.strip()) for doc_id, name in pairs]
+    except Exception:
+        return []
+
+
+def _parse_ptr_pdf(doc_id, year):
+    """Download one PTR PDF and return list of stock trade dicts."""
+    try:
+        url = f"{HOUSE_PTR_BASE}/{year}/{doc_id}.pdf"
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        reader = PdfReader(io.BytesIO(r.content))
+        text = " ".join(p.extract_text() or "" for p in reader.pages).replace("\x00", "")
+
+        name_m = re.search(r"Name\s*:\s*((?:Hon\.\s+)?[^\n]+)", text)
+        name = name_m.group(1).strip() if name_m else "Unknown"
+
+        tx_start = text.find("ID Owner Asset")
+        if tx_start == -1:
+            return []
+        tx_text = text[tx_start:]
+        cert = tx_text.find("I CERTIFY")
+        if cert > -1:
+            tx_text = tx_text[:cert]
+
+        trades = []
+        for m in re.finditer(
+            r"\(([A-Z]{1,6})\)\s*\[ST\]\s*\n?\s*([PS])\s*"
+            r"(\d{2}/\d{2}/\d{4})\d{2}/\d{2}/\d{4}"
+            r"(\$[\d,]+\s*-\s*\n?\s*\$[\d,]+)",
+            tx_text,
+        ):
+            ticker   = m.group(1)
+            tx_type  = "PURCHASE" if m.group(2) == "P" else "SALE"
+            tx_date  = m.group(3)          # MM/DD/YYYY
+            amount   = re.sub(r"\s+", " ", m.group(4).strip())
+
+            # Company name: look back up to 200 chars before (TICKER)
+            snippet  = tx_text[max(0, m.start() - 200): m.start()]
+            lines    = [l.strip() for l in snippet.split("\n")]
+            parts    = []
+            for line in reversed(lines):
+                if not line:
+                    continue
+                if _HDR_PAT.match(line):
+                    break
+                line = _OWNER_PAT.sub("", line).strip()
+                if line:
+                    parts.insert(0, line)
+                if len(parts) >= 3:
+                    break
+            company = " ".join(parts)[:48].strip()
+
+            # Normalise date to YYYY-MM-DD
+            try:
+                iso_date = datetime.strptime(tx_date, "%m/%d/%Y").strftime("%Y-%m-%d")
+            except ValueError:
+                iso_date = tx_date
+
+            trades.append({
+                "chamber":          "HOUSE",
+                "name":             name,
+                "ticker":           ticker,
+                "company":          company,
+                "trade_type":       tx_type,
+                "amount":           amount,
+                "amount_rank":      _AMOUNT_RANK.get(amount, 0),
+                "transaction_date": iso_date,
+                "disclosure_date":  "",
+            })
+        return trades
+    except Exception:
+        return []
 
 
 def _fetch_congress_trades():
-    """Fetch + merge House and Senate disclosures. Returns list of dicts."""
+    """Scrape House PTR PDFs in parallel. Returns sorted list of trade dicts."""
+    year  = datetime.now().year
+    # (doc_id, filing_year) pairs
+    tagged = [(doc_id, year) for doc_id, _ in _search_house_ptrs(year)]
+    # Also pull prior year if we're early in the year (< April)
+    if datetime.now().month < 4:
+        tagged += [(doc_id, year - 1) for doc_id, _ in _search_house_ptrs(year - 1)]
+
     rows = []
-
-    def pull_house():
-        try:
-            r = requests.get(HOUSE_URL, headers=HEADERS, timeout=30)
-            r.raise_for_status()
-            for t in r.json():
-                ticker = (t.get("ticker") or "").strip().upper()
-                if not ticker or ticker in ("--", "N/A"):
-                    continue
-                rows.append({
-                    "chamber":          "HOUSE",
-                    "name":             t.get("representative", "").strip(),
-                    "ticker":           ticker,
-                    "company":          (t.get("asset_description") or "")[:48].strip(),
-                    "trade_type":       (t.get("type") or "").strip().upper(),
-                    "amount":           t.get("amount", ""),
-                    "amount_rank":      _AMOUNT_RANK.get((t.get("amount") or "").lower().strip(), 0),
-                    "transaction_date": _norm_date(t.get("transaction_date", "")),
-                    "disclosure_date":  _norm_date(t.get("disclosure_date", "")),
-                })
-        except Exception:
-            pass
-
-    def pull_senate():
-        try:
-            r = requests.get(SENATE_URL, headers=HEADERS, timeout=30)
-            r.raise_for_status()
-            for t in r.json():
-                ticker = (t.get("ticker") or "").strip().upper()
-                if not ticker or ticker in ("--", "N/A"):
-                    continue
-                rows.append({
-                    "chamber":          "SENATE",
-                    "name":             t.get("senator", "").strip(),
-                    "ticker":           ticker,
-                    "company":          (t.get("asset_description") or "")[:48].strip(),
-                    "trade_type":       (t.get("type") or "").strip().upper(),
-                    "amount":           t.get("amount", ""),
-                    "amount_rank":      _AMOUNT_RANK.get((t.get("amount") or "").lower().strip(), 0),
-                    "transaction_date": _norm_date(t.get("transaction_date", "")),
-                    "disclosure_date":  _norm_date(t.get("disclosure_date", "")),
-                })
-        except Exception:
-            pass
-
-    t1 = threading.Thread(target=pull_house)
-    t2 = threading.Thread(target=pull_senate)
-    t1.start(); t2.start()
-    t1.join();  t2.join()
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(_parse_ptr_pdf, doc_id, yr): doc_id for doc_id, yr in tagged}
+        for fut in as_completed(futures):
+            rows.extend(fut.result())
 
     rows.sort(key=lambda x: x["transaction_date"], reverse=True)
     return rows
@@ -425,7 +469,7 @@ def _fetch_congress_trades():
 def _get_congress(force=False):
     now = time.time()
     if force or now - _congress_cache["fetched"] > CONGRESS_TTL or not _congress_cache["data"]:
-        _congress_cache["data"]   = _fetch_congress_trades()
+        _congress_cache["data"]    = _fetch_congress_trades()
         _congress_cache["fetched"] = now
     return _congress_cache["data"]
 
