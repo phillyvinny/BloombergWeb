@@ -15,44 +15,44 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 import numpy as np
 import requests
-import yfinance as yf
 import uvicorn
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, Response
 from pypdf import PdfReader
 
 # ── Config ──────────────────────────────────────────────────────────────────────
-YAHOO_CHART_URL  = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-NEWS_RSS_URL     = "https://finance.yahoo.com/news/rss"
+POLYGON_BASE    = "https://api.polygon.io"
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "OehRygcqWPd78jOSWTBgfhu9oCsBqxcw")
 
 LAUNCHPAD_INDICES = [
     # symbol=None → section header row (no fetch)
-    (None,        "── INDICES ──"),
-    ("^DJI",      "DOW JONES"),
-    ("^GSPC",     "S&P 500"),
-    ("^IXIC",     "NASDAQ"),
-    ("^RUT",      "RUSSELL 2K"),
-    ("^VIX",      "VIX"),
-    ("^TNX",      "10Y YIELD"),
-    (None,        "── COMMODITIES ──"),
-    ("GC=F",      "GOLD"),
-    ("SI=F",      "SILVER"),
-    ("CL=F",      "CRUDE OIL"),
-    ("NG=F",      "NAT GAS"),
-    ("HG=F",      "COPPER"),
-    (None,        "── CURRENCIES ──"),
-    ("DX-Y.NYB",  "USD INDEX"),
-    ("EURUSD=X",  "EUR / USD"),
-    ("GBPUSD=X",  "GBP / USD"),
-    ("JPY=X",     "USD / JPY"),
-    ("CHFUSD=X",  "USD / CHF"),
-    (None,        "── CRYPTO ──"),
-    ("BTC-USD",   "BITCOIN"),
-    ("ETH-USD",   "ETHEREUM"),
+    # Stocks/ETFs use Polygon stock snapshot; C: = forex; X: = crypto
+    (None,         "── INDICES ──"),
+    ("DIA",        "DOW JONES"),      # Dow Jones ETF
+    ("SPY",        "S&P 500"),        # S&P 500 ETF
+    ("QQQ",        "NASDAQ"),         # NASDAQ ETF
+    ("IWM",        "RUSSELL 2K"),     # Russell 2000 ETF
+    ("VIXY",       "VIX"),            # VIX ETF
+    ("TLT",        "10Y YIELD"),      # 20yr Treasury ETF
+    (None,         "── COMMODITIES ──"),
+    ("GLD",        "GOLD"),           # Gold ETF
+    ("SLV",        "SILVER"),         # Silver ETF
+    ("USO",        "CRUDE OIL"),      # Crude Oil ETF
+    ("UNG",        "NAT GAS"),        # Nat Gas ETF
+    ("COPX",       "COPPER"),         # Copper ETF
+    (None,         "── CURRENCIES ──"),
+    ("UUP",        "USD INDEX"),      # USD Index ETF
+    ("C:EURUSD",   "EUR / USD"),
+    ("C:GBPUSD",   "GBP / USD"),
+    ("C:USDJPY",   "USD / JPY"),
+    ("C:USDCHF",   "USD / CHF"),
+    (None,         "── CRYPTO ──"),
+    ("X:BTCUSD",   "BITCOIN"),
+    ("X:ETHUSD",   "ETHEREUM"),
 ]
 
 SECTORS = [
@@ -235,13 +235,8 @@ def _analyst_score(mean):
 
 
 def _fetch_analyst(sym):
-    try:
-        info = yf.Ticker(sym).info
-        mean = info.get("recommendationMean")
-        n    = info.get("numberOfAnalystOpinions", 0)
-        return float(mean) if (mean is not None and n >= 2) else None
-    except Exception:
-        return None
+    # Analyst consensus not available from Polygon; returns None so score is 0
+    return None
 
 
 def _bar(score, mx=20):
@@ -251,26 +246,29 @@ def _bar(score, mx=20):
 
 def _fetch_one(sym, idx):
     try:
+        today     = date.today()
+        from_date = str(today - timedelta(days=90))
+        to_date   = str(today)
         r = requests.get(
-            YAHOO_CHART_URL.format(symbol=sym),
-            params={"interval": "1d", "range": "3mo"},
-            headers=HEADERS, timeout=10,
+            f"{POLYGON_BASE}/v2/aggs/ticker/{sym}/range/1/day/{from_date}/{to_date}",
+            params={"apiKey": POLYGON_API_KEY, "adjusted": "true", "sort": "asc", "limit": 500},
+            headers=HEADERS, timeout=15,
         )
         r.raise_for_status()
-        res    = r.json()["chart"]["result"][0]
-        meta   = res["meta"]
-        closes = [c for c in res["indicators"]["quote"][0].get("close", []) if c is not None]
+        bars   = r.json().get("results", [])
+        closes = [b["c"] for b in bars if b.get("c") is not None]
         sc     = _score(closes)
         if sc is None:
             return None
-        analyst_mean = _fetch_analyst(sym)
-        analyst_s    = _analyst_score(analyst_mean)
-        total        = sc["total"] + analyst_s
-        signal       = "BUY" if total >= SCORE_BUY else ("WATCH" if total >= SCORE_WATCH else "NO BUY")
+        analyst_s    = 0
+        analyst_mean = None
+        total  = sc["total"]
+        signal = "BUY" if total >= SCORE_BUY else ("WATCH" if total >= SCORE_WATCH else "NO BUY")
+        price  = closes[-1] if closes else 0.0
         return {
             "symbol":       sym,
-            "name":         (meta.get("longName") or meta.get("shortName") or sym)[:32],
-            "price":        float(meta.get("regularMarketPrice") or (closes[-1] if closes else 0)),
+            "name":         sym,
+            "price":        round(price, 4),
             "index":        idx,
             "ema_s":        sc["ema_s"],
             "macd_s":       sc["macd_s"],
@@ -281,12 +279,11 @@ def _fetch_one(sym, idx):
             "total":        total,
             "rsi":          sc["rsi"],
             "signal":       signal,
-            # Pre-rendered bar strings
             "bar_ema":      _bar(sc["ema_s"]),
             "bar_macd":     _bar(sc["macd_s"]),
             "bar_rsi":      _bar(sc["rsi_s"]),
             "bar_trend":    _bar(sc["trend_s"]),
-            "bar_analyst":  _bar(analyst_s) if analyst_mean is not None else "\u2591" * 8,
+            "bar_analyst":  "\u2591" * 8,
         }
     except Exception:
         return None
@@ -319,28 +316,23 @@ def trigger_refresh():
 # ── MACD Chart Data ──────────────────────────────────────────────────────────────
 def _compute_chart_data(sym):
     """Fetch 6 months of OHLCV data and return full indicator series for charting."""
+    today     = date.today()
+    from_date = str(today - timedelta(days=180))
+    to_date   = str(today)
     r = requests.get(
-        YAHOO_CHART_URL.format(symbol=sym),
-        params={"interval": "1d", "range": "6mo"},
+        f"{POLYGON_BASE}/v2/aggs/ticker/{sym}/range/1/day/{from_date}/{to_date}",
+        params={"apiKey": POLYGON_API_KEY, "adjusted": "true", "sort": "asc", "limit": 500},
         headers=HEADERS, timeout=15,
     )
     r.raise_for_status()
-    result     = r.json()["chart"]["result"][0]
-    meta       = result["meta"]
-    timestamps = result.get("timestamp", [])
-    quote      = result["indicators"]["quote"][0]
-    opens_raw  = quote.get("open",   [])
-    highs_raw  = quote.get("high",   [])
-    lows_raw   = quote.get("low",    [])
-    closes_raw = quote.get("close",  [])
-    vols_raw   = quote.get("volume", [])
+    bars = r.json().get("results", [])
 
     rows = []
-    for t, o, h, l, c, v in zip(timestamps, opens_raw, highs_raw, lows_raw, closes_raw, vols_raw):
-        if any(x is None for x in [o, h, l, c]):
+    for b in bars:
+        if any(b.get(k) is None for k in ["o", "h", "l", "c"]):
             continue
-        date = datetime.utcfromtimestamp(t).strftime("%Y-%m-%d")
-        rows.append((date, float(o), float(h), float(l), float(c), int(v or 0)))
+        dt = datetime.utcfromtimestamp(b["t"] / 1000).strftime("%Y-%m-%d")
+        rows.append((dt, float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"]), int(b.get("v") or 0)))
 
     if len(rows) < 35:
         return None
@@ -364,7 +356,7 @@ def _compute_chart_data(sym):
 
     return {
         "symbol":     sym,
-        "name":       (meta.get("longName") or meta.get("shortName") or sym),
+        "name":       sym,
         "price":      round(closes[-1], 2),
         "candles":    [{"time": d, "open": o, "high": h, "low": l, "close": c}
                        for d, o, h, l, c, v in rows],
@@ -719,17 +711,31 @@ NEWS_TTL    = 300
 
 
 def _fetch_quote(symbol):
-    r = requests.get(
-        YAHOO_CHART_URL.format(symbol=symbol),
-        params={"interval": "1d", "range": "5d"},
-        headers=HEADERS, timeout=10,
-    )
-    r.raise_for_status()
-    meta  = r.json()["chart"]["result"][0]["meta"]
-    price = float(meta.get("regularMarketPrice") or 0)
-    prev  = float(meta.get("chartPreviousClose") or meta.get("previousClose") or price)
-    chg   = price - prev
-    pct   = (chg / prev * 100) if prev else 0.0
+    """Fetch current price + daily change via Polygon. Handles stocks, forex (C:), crypto (X:)."""
+    params = {"apiKey": POLYGON_API_KEY}
+    if symbol.startswith("X:"):
+        url  = f"{POLYGON_BASE}/v2/snapshot/locale/global/markets/crypto/tickers/{symbol}"
+        r    = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data  = r.json().get("ticker", {})
+        price = float(data.get("day", {}).get("c") or data.get("lastTrade", {}).get("p") or 0)
+        prev  = float(data.get("prevDay", {}).get("c") or price)
+    elif symbol.startswith("C:"):
+        url  = f"{POLYGON_BASE}/v2/snapshot/locale/global/markets/forex/tickers/{symbol}"
+        r    = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data  = r.json().get("ticker", {})
+        price = float(data.get("day", {}).get("c") or data.get("lastTrade", {}).get("p") or 0)
+        prev  = float(data.get("prevDay", {}).get("c") or price)
+    else:
+        url  = f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}"
+        r    = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data  = r.json().get("results") or r.json().get("ticker") or {}
+        price = float(data.get("day", {}).get("c") or data.get("lastTrade", {}).get("p") or 0)
+        prev  = float(data.get("prevDay", {}).get("c") or price)
+    chg = price - prev
+    pct = (chg / prev * 100) if prev else 0.0
     return round(price, 4), round(chg, 4), round(pct, 3)
 
 
@@ -783,24 +789,23 @@ def _get_home(force=False):
 
 
 def _fetch_news():
-    r = requests.get(NEWS_RSS_URL, headers=HEADERS, timeout=10)
+    r = requests.get(
+        f"{POLYGON_BASE}/v2/reference/news",
+        params={"apiKey": POLYGON_API_KEY, "limit": 25, "order": "desc", "sort": "published_utc"},
+        headers=HEADERS, timeout=10,
+    )
     r.raise_for_status()
     news = []
-    for item in re.findall(r"<item>(.*?)</item>", r.text, re.DOTALL)[:25]:
-        title_m = re.search(r"<title>(.*?)</title>", item)
-        link_m  = re.search(r"<link>(.*?)</link>",   item)
-        date_m  = re.search(r"<pubDate>(.*?)</pubDate>", item)
-        if not title_m:
-            continue
-        title = title_m.group(1)
-        title = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", title)
-        title = title.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        raw   = (date_m.group(1) if date_m else "").strip()
+    for item in r.json().get("results", []):
+        title = (item.get("title") or "")[:110]
+        link  = item.get("article_url") or "#"
+        raw   = item.get("published_utc", "")
         try:
-            ts = datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").strftime("%H:%M")
+            ts = datetime.strptime(raw[:19], "%Y-%m-%dT%H:%M:%S").strftime("%H:%M")
         except Exception:
-            ts = raw[:5]
-        news.append({"title": title[:110], "link": link_m.group(1) if link_m else "#", "time": ts})
+            ts = raw[11:16] if len(raw) >= 16 else ""
+        if title:
+            news.append({"title": title, "link": link, "time": ts})
     return news
 
 
@@ -977,30 +982,35 @@ async def api_home():
 
 
 # ── Sector range fetch ────────────────────────────────────────────────────────────
-_RANGE_PARAMS = {
-    "1d":  {"interval": "1d",  "range": "5d"},
-    "1w":  {"interval": "1d",  "range": "5d"},
-    "1m":  {"interval": "1d",  "range": "1mo"},
-    "3m":  {"interval": "1wk", "range": "3mo"},
-    "6m":  {"interval": "1wk", "range": "6mo"},
-    "ytd": {"interval": "1wk", "range": "ytd"},
-    "1y":  {"interval": "1mo", "range": "1y"},
-}
+def _sector_date_range(range_str):
+    today = date.today()
+    if range_str == "1w":  return str(today - timedelta(days=7)),   str(today)
+    if range_str == "1m":  return str(today - timedelta(days=30)),  str(today)
+    if range_str == "3m":  return str(today - timedelta(days=90)),  str(today)
+    if range_str == "6m":  return str(today - timedelta(days=180)), str(today)
+    if range_str == "ytd": return str(today.replace(month=1, day=1)), str(today)
+    if range_str == "1y":  return str(today - timedelta(days=365)), str(today)
+    return None, None  # 1d → use snapshot
 
 def _fetch_sector_pct(symbol, range_str):
-    params = _RANGE_PARAMS.get(range_str, _RANGE_PARAMS["1d"])
-    r = requests.get(YAHOO_CHART_URL.format(symbol=symbol),
-                     params=params, headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    result = r.json()["chart"]["result"][0]
-    meta   = result["meta"]
+    params = {"apiKey": POLYGON_API_KEY}
     if range_str == "1d":
-        price = float(meta.get("regularMarketPrice") or 0)
-        prev  = float(meta.get("chartPreviousClose") or meta.get("previousClose") or price)
+        url  = f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}"
+        r    = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data  = r.json().get("results") or r.json().get("ticker") or {}
+        price = float(data.get("day", {}).get("c") or 0)
+        prev  = float(data.get("prevDay", {}).get("c") or price)
         pct   = (price - prev) / prev * 100 if prev else 0.0
     else:
-        closes = result["indicators"]["quote"][0].get("close", [])
-        closes = [c for c in closes if c is not None]
+        from_date, to_date = _sector_date_range(range_str)
+        r = requests.get(
+            f"{POLYGON_BASE}/v2/aggs/ticker/{symbol}/range/1/day/{from_date}/{to_date}",
+            params={**params, "adjusted": "true", "sort": "asc", "limit": 500},
+            headers=HEADERS, timeout=10,
+        )
+        r.raise_for_status()
+        closes = [b["c"] for b in r.json().get("results", []) if b.get("c") is not None]
         pct    = (closes[-1] - closes[0]) / closes[0] * 100 if len(closes) >= 2 else 0.0
     return round(pct, 3)
 
@@ -1192,7 +1202,7 @@ setInterval(tick,1000); tick();
 function pctCls(v){return v>0?'pos':v<0?'neg':'flat';}
 function sign(v){return v>0?'+':'';}
 function fmtPrice(v,sym){
-  if(sym==='BTC-USD'||sym==='^GSPC'||v>10000) return v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  if(sym==='X:BTCUSD'||v>10000) return v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
   if(v<1) return v.toFixed(4);
   return v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
 }
