@@ -457,10 +457,13 @@ def _fetch_congress_trades():
         tagged += [(doc_id, year - 1) for doc_id, _ in _search_house_ptrs(year - 1)]
 
     rows = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_parse_ptr_pdf, doc_id, yr): doc_id for doc_id, yr in tagged}
-        for fut in as_completed(futures):
-            rows.extend(fut.result())
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = {pool.submit(_parse_ptr_pdf, doc_id, yr): doc_id for doc_id, yr in tagged}
+            for fut in as_completed(futures):
+                rows.extend(fut.result())
+    except RuntimeError:
+        pass  # interpreter shutting down — ignore
 
     rows.sort(key=lambda x: x["transaction_date"], reverse=True)
     return rows
