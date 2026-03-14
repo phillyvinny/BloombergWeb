@@ -16,6 +16,17 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timedelta
+try:
+    from zoneinfo import ZoneInfo as _ZI
+    _ET = _ZI("America/New_York")
+    def _et_now(): return datetime.now(_ET).replace(tzinfo=None)
+except ImportError:
+    def _et_now():
+        utc  = datetime.utcnow()
+        yr   = utc.year
+        dst_start = datetime(yr, 3,  8) + timedelta(days=(6 - datetime(yr, 3,  8).weekday()) % 7)
+        dst_end   = datetime(yr, 11, 1) + timedelta(days=(6 - datetime(yr, 11, 1).weekday()) % 7)
+        return utc + timedelta(hours=-4 if dst_start <= utc < dst_end else -5)
 
 import numpy as np
 import requests
@@ -75,10 +86,11 @@ HEADERS          = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
-REFRESH_INTERVAL = 300
-MAX_WORKERS      = 20
-SCORE_BUY        = 65
-SCORE_WATCH      = 40
+REFRESH_INTERVAL  = 300
+MAX_WORKERS       = 5    # keep within Polygon rate limits
+SCORE_BUY         = 65
+SCORE_WATCH       = 40
+_POLY_SEMAPHORE   = threading.Semaphore(5)  # max 5 concurrent Polygon calls
 
 # ── Universe ─────────────────────────────────────────────────────────────────────
 DOW_30 = [
@@ -249,13 +261,12 @@ def _fetch_one(sym, idx):
         today     = date.today()
         from_date = str(today - timedelta(days=90))
         to_date   = str(today)
-        r = requests.get(
+        data  = _poly_get(
             f"{POLYGON_BASE}/v2/aggs/ticker/{sym}/range/1/day/{from_date}/{to_date}",
-            params={"apiKey": POLYGON_API_KEY, "adjusted": "true", "sort": "asc", "limit": 500},
-            headers=HEADERS, timeout=15,
+            params={"adjusted": "true", "sort": "asc", "limit": 500},
+            timeout=20,
         )
-        r.raise_for_status()
-        bars   = r.json().get("results", [])
+        bars   = data.get("results") or []
         closes = [b["c"] for b in bars if b.get("c") is not None]
         sc     = _score(closes)
         if sc is None:
@@ -313,19 +324,42 @@ def trigger_refresh():
     if not _state["loading"]:
         threading.Thread(target=_bg_refresh, daemon=True).start()
 
+# ── Polygon helper ───────────────────────────────────────────────────────────────
+def _poly_get(url, params=None, timeout=15, retries=5):
+    """GET a Polygon endpoint, retrying on 429 with exponential backoff."""
+    p = {"apiKey": POLYGON_API_KEY, **(params or {})}
+    for attempt in range(retries):
+        r = requests.get(url, params=p, headers=HEADERS, timeout=timeout)
+        if r.status_code == 429:
+            time.sleep(2 ** attempt)   # 1 s, 2 s, 4 s, 8 s, 16 s
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise RuntimeError(f"Polygon rate-limited after {retries} retries: {url}")
+
+
+def _market_open():
+    """True when NYSE is open: Mon–Fri, 09:30–16:00 ET."""
+    now = _et_now()
+    if now.weekday() >= 5:                         # Saturday=5, Sunday=6
+        return False
+    open_t  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_t = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_t <= now <= close_t
+
+
 # ── MACD Chart Data ──────────────────────────────────────────────────────────────
 def _compute_chart_data(sym):
     """Fetch 6 months of OHLCV data and return full indicator series for charting."""
     today     = date.today()
     from_date = str(today - timedelta(days=180))
     to_date   = str(today)
-    r = requests.get(
+    data = _poly_get(
         f"{POLYGON_BASE}/v2/aggs/ticker/{sym}/range/1/day/{from_date}/{to_date}",
-        params={"apiKey": POLYGON_API_KEY, "adjusted": "true", "sort": "asc", "limit": 500},
-        headers=HEADERS, timeout=15,
+        params={"adjusted": "true", "sort": "asc", "limit": 500},
+        timeout=20,
     )
-    r.raise_for_status()
-    bars = r.json().get("results", [])
+    bars = data.get("results") or []
 
     rows = []
     for b in bars:
@@ -712,30 +746,19 @@ NEWS_TTL    = 300
 
 def _fetch_quote(symbol):
     """Fetch current price + daily change via Polygon. Handles stocks, forex (C:), crypto (X:)."""
-    params = {"apiKey": POLYGON_API_KEY}
     if symbol.startswith("X:"):
-        url  = f"{POLYGON_BASE}/v2/snapshot/locale/global/markets/crypto/tickers/{symbol}"
-        r    = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        data  = r.json().get("ticker", {})
-        price = float(data.get("day", {}).get("c") or data.get("lastTrade", {}).get("p") or 0)
-        prev  = float(data.get("prevDay", {}).get("c") or price)
+        raw   = _poly_get(f"{POLYGON_BASE}/v2/snapshot/locale/global/markets/crypto/tickers/{symbol}")
+        inner = raw.get("ticker", {})
     elif symbol.startswith("C:"):
-        url  = f"{POLYGON_BASE}/v2/snapshot/locale/global/markets/forex/tickers/{symbol}"
-        r    = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        data  = r.json().get("ticker", {})
-        price = float(data.get("day", {}).get("c") or data.get("lastTrade", {}).get("p") or 0)
-        prev  = float(data.get("prevDay", {}).get("c") or price)
+        raw   = _poly_get(f"{POLYGON_BASE}/v2/snapshot/locale/global/markets/forex/tickers/{symbol}")
+        inner = raw.get("ticker", {})
     else:
-        url  = f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}"
-        r    = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        data  = r.json().get("results") or r.json().get("ticker") or {}
-        price = float(data.get("day", {}).get("c") or data.get("lastTrade", {}).get("p") or 0)
-        prev  = float(data.get("prevDay", {}).get("c") or price)
-    chg = price - prev
-    pct = (chg / prev * 100) if prev else 0.0
+        raw   = _poly_get(f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}")
+        inner = raw.get("results") or raw.get("ticker") or {}
+    price = float(inner.get("day", {}).get("c") or inner.get("lastTrade", {}).get("p") or 0)
+    prev  = float(inner.get("prevDay", {}).get("c") or price)
+    chg   = price - prev
+    pct   = (chg / prev * 100) if prev else 0.0
     return round(price, 4), round(chg, 4), round(pct, 3)
 
 
@@ -835,6 +858,7 @@ async def api_status():
     n_watch = sum(1 for s in _state["stocks"].values() if s["signal"] == "WATCH")
     n_no    = sum(1 for s in _state["stocks"].values() if s["signal"] == "NO BUY")
     nr      = max(0.0, _state["next_refresh"] - time.time())
+    now_et = _et_now()
     return _json({
         "loading":      loading,
         "loaded":       loaded,
@@ -847,6 +871,8 @@ async def api_status():
         "n_buy":        n_buy,
         "n_watch":      n_watch,
         "n_no_buy":     n_no,
+        "market_open":  _market_open(),
+        "et_time":      now_et.strftime("%H:%M ET %a"),
     })
 
 
@@ -993,24 +1019,19 @@ def _sector_date_range(range_str):
     return None, None  # 1d → use snapshot
 
 def _fetch_sector_pct(symbol, range_str):
-    params = {"apiKey": POLYGON_API_KEY}
     if range_str == "1d":
-        url  = f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}"
-        r    = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        data  = r.json().get("results") or r.json().get("ticker") or {}
+        raw   = _poly_get(f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}")
+        data  = raw.get("results") or raw.get("ticker") or {}
         price = float(data.get("day", {}).get("c") or 0)
         prev  = float(data.get("prevDay", {}).get("c") or price)
         pct   = (price - prev) / prev * 100 if prev else 0.0
     else:
         from_date, to_date = _sector_date_range(range_str)
-        r = requests.get(
+        raw    = _poly_get(
             f"{POLYGON_BASE}/v2/aggs/ticker/{symbol}/range/1/day/{from_date}/{to_date}",
-            params={**params, "adjusted": "true", "sort": "asc", "limit": 500},
-            headers=HEADERS, timeout=10,
+            params={"adjusted": "true", "sort": "asc", "limit": 500},
         )
-        r.raise_for_status()
-        closes = [b["c"] for b in r.json().get("results", []) if b.get("c") is not None]
+        closes = [b["c"] for b in (raw.get("results") or []) if b.get("c") is not None]
         pct    = (closes[-1] - closes[0]) / closes[0] * 100 if len(closes) >= 2 else 0.0
     return round(pct, 3)
 
@@ -1511,6 +1532,9 @@ tbody tr:hover{background:#0d1535}
 </div>
 <hr>
 
+<div id="market-banner" style="display:none;background:#1a0a00;border:1px solid #f0b429;color:#f0b429;font-size:13px;padding:5px 12px;margin-bottom:6px;letter-spacing:.6px;">
+  &#9632; MARKET CLOSED &mdash; <span id="market-banner-time"></span> &mdash; Showing last closing prices
+</div>
 <div class="tbl-wrap" id="tbl-wrap">
   <div id="loading-msg">Initializing&hellip;</div>
   <table id="data-table" style="display:none">
@@ -1671,9 +1695,17 @@ async function pollStatus(){
       upd.textContent=`  Updated: ${st.last_updated}`+
         `   |   BUY: ${st.n_buy}   WATCH: ${st.n_watch}   NO BUY: ${st.n_no_buy}`+
         `   |   Errors: ${st.error_count}`;
+      // Market closed banner
+      const banner=document.getElementById('market-banner');
+      const bannerTime=document.getElementById('market-banner-time');
+      if(st.market_open===false){
+        banner.style.display='block';
+        bannerTime.textContent=st.et_time||'';
+      } else {
+        banner.style.display='none';
+      }
       startCountdown(st.next_refresh);
       await fetchAndRender();
-      // schedule next auto-refresh
       setTimeout(manualRefresh, st.next_refresh*1000);
     }
   } catch(e){
