@@ -903,6 +903,55 @@ async def api_home():
     return _json(_get_home())
 
 
+# ── Sector range fetch ────────────────────────────────────────────────────────────
+_RANGE_PARAMS = {
+    "1d":  {"interval": "1d",  "range": "5d"},
+    "1w":  {"interval": "1d",  "range": "5d"},
+    "1m":  {"interval": "1d",  "range": "1mo"},
+    "3m":  {"interval": "1wk", "range": "3mo"},
+    "6m":  {"interval": "1wk", "range": "6mo"},
+    "ytd": {"interval": "1wk", "range": "ytd"},
+    "1y":  {"interval": "1mo", "range": "1y"},
+}
+
+def _fetch_sector_pct(symbol, range_str):
+    params = _RANGE_PARAMS.get(range_str, _RANGE_PARAMS["1d"])
+    r = requests.get(YAHOO_CHART_URL.format(symbol=symbol),
+                     params=params, headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    result = r.json()["chart"]["result"][0]
+    meta   = result["meta"]
+    if range_str == "1d":
+        price = float(meta.get("regularMarketPrice") or 0)
+        prev  = float(meta.get("chartPreviousClose") or meta.get("previousClose") or price)
+        pct   = (price - prev) / prev * 100 if prev else 0.0
+    else:
+        closes = result["indicators"]["quote"][0].get("close", [])
+        closes = [c for c in closes if c is not None]
+        pct    = (closes[-1] - closes[0]) / closes[0] * 100 if len(closes) >= 2 else 0.0
+    return round(pct, 3)
+
+
+def _fetch_sectors_for_range(range_str):
+    results = []
+    with ThreadPoolExecutor(max_workers=11) as pool:
+        futs = {pool.submit(_fetch_sector_pct, sym, range_str): (sym, name) for sym, name in SECTORS}
+        for fut, (sym, name) in futs.items():
+            try:
+                pct = fut.result()
+            except Exception:
+                pct = 0.0
+            results.append({"symbol": sym, "name": name, "pct": pct})
+    order = {sym: i for i, (sym, _) in enumerate(SECTORS)}
+    results.sort(key=lambda x: order.get(x["symbol"], 99))
+    return results
+
+
+@app.get("/api/sectors")
+async def api_sectors(range: str = "1d"):
+    return _json({"sectors": _fetch_sectors_for_range(range)})
+
+
 @app.get("/api/news")
 async def api_news():
     return _json({"items": _get_news()})
@@ -965,6 +1014,9 @@ body{background:var(--bg);color:var(--white);
 /* Sector chart */
 .chart-wrap{flex:1;padding:8px;display:flex;align-items:stretch;justify-content:center;min-height:0;position:relative}
 canvas{width:100%!important;height:100%!important}
+.tf-btn{background:#0d1830;border:1px solid #1e2d50;color:#a0a8c0;font-family:Consolas,'Courier New',monospace;font-size:12px;padding:2px 8px;cursor:pointer;border-radius:2px}
+.tf-btn:hover{background:#1a2840;color:#fff}
+.tf-btn.active{background:#1a3a6e;border-color:#3a6bbf;color:#f0b429;font-weight:bold}
 /* Top Signals */
 .sig-table{width:100%;border-collapse:collapse}
 .sig-table td{padding:4px 8px;border-bottom:1px solid #0a1428;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1017,8 +1069,17 @@ canvas{width:100%!important;height:100%!important}
   <!-- Panel 2: Sector Performance -->
   <div class="panel">
     <div class="panel-hdr">
-      <span class="dot">&#9672;</span> SECTOR PERFORMANCE &mdash; TODAY
+      <span class="dot">&#9672;</span> <span id="sec-title">SECTOR PERFORMANCE &mdash; TODAY</span>
       <span class="sub" id="sec-updated"></span>
+    </div>
+    <div style="display:flex;gap:4px;padding:4px 8px;background:var(--panel)">
+      <button class="tf-btn active" onclick="setSectorRange('1d',this)">1D</button>
+      <button class="tf-btn" onclick="setSectorRange('1w',this)">1W</button>
+      <button class="tf-btn" onclick="setSectorRange('1m',this)">1M</button>
+      <button class="tf-btn" onclick="setSectorRange('3m',this)">3M</button>
+      <button class="tf-btn" onclick="setSectorRange('6m',this)">6M</button>
+      <button class="tf-btn" onclick="setSectorRange('ytd',this)">YTD</button>
+      <button class="tf-btn" onclick="setSectorRange('1y',this)">1Y</button>
     </div>
     <div class="chart-wrap">
       <canvas id="sector-chart"></canvas>
@@ -1135,12 +1196,15 @@ function renderSectors(sectors){
           labels:{
             color:'#ffffff',
             font:{family:"Consolas,'Courier New',monospace",size:13},
-            boxWidth:13,padding:8,
+            boxWidth:14,padding:10,
             generateLabels(chart){
               return chart.data.labels.map((label,i)=>{
                 const pct=pcts[i];
-                return{text:`${label}  ${pct>=0?'+':''}${pct.toFixed(2)}%`,
-                  fillStyle:colors[i],strokeStyle:'#0d1830',lineWidth:1,hidden:false,index:i};
+                return{
+                  text:`${label}  ${pct>=0?'+':''}${pct.toFixed(2)}%`,
+                  fillStyle:colors[i],strokeStyle:'#0d1830',lineWidth:1,
+                  hidden:false,index:i,fontColor:'#ffffff',color:'#ffffff'
+                };
               });
             }
           }
@@ -1159,6 +1223,20 @@ function renderSectors(sectors){
       }}
     }
   });
+}
+
+const _SEC_LABELS={'1d':'TODAY','1w':'THIS WEEK','1m':'THIS MONTH','3m':'3 MONTHS','6m':'6 MONTHS','ytd':'YTD','1y':'1 YEAR'};
+async function setSectorRange(range,btn){
+  document.querySelectorAll('.tf-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('sec-title').textContent=`SECTOR PERFORMANCE \u2014 ${_SEC_LABELS[range]||range.toUpperCase()}`;
+  document.getElementById('sec-updated').textContent='Loading...';
+  try{
+    const r=await fetch(`/api/sectors?range=${range}`);
+    const d=await r.json();
+    renderSectors(d.sectors||[]);
+    document.getElementById('sec-updated').textContent='Updated '+new Date().toTimeString().slice(0,8);
+  }catch(e){console.error(e);}
 }
 
 function renderSignals(sigs){
