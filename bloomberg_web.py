@@ -486,6 +486,99 @@ def _get_congress(force=False):
     return _congress_cache["data"]  # return whatever is cached right now
 
 
+# ── Legislation Data ─────────────────────────────────────────────────────────────
+GOVTRACK_URL  = "https://www.govtrack.us/api/v2/bill"
+LEGIS_TTL     = 3600   # 1-hour cache
+
+_legis_cache  = {"data": [], "fetched": 0.0, "loading": False}
+
+
+def _parse_bill_chambers(bill):
+    """Return (house_passed, senate_passed, signed) from major_actions."""
+    house_passed = senate_passed = False
+    signed = bill.get("current_status") == "enacted_signed"
+    for action in bill.get("major_actions", []):
+        if len(action) < 4:
+            continue
+        xml = action[3]
+        if 'where="h"' in xml and 'result="pass"' in xml:
+            house_passed = True
+        if 'where="s"' in xml and 'result="pass"' in xml:
+            senate_passed = True
+    return house_passed, senate_passed, signed
+
+
+def _fetch_bills():
+    """Fetch recent bills from GovTrack for the current Congress."""
+    congress = 119
+    bills    = []
+    seen     = set()
+
+    # Pull the most recently active bills across all statuses
+    for offset in range(0, 600, 100):
+        try:
+            r = requests.get(
+                GOVTRACK_URL,
+                params={
+                    "congress":   congress,
+                    "order_by":   "-current_status_date",
+                    "limit":      100,
+                    "offset":     offset,
+                },
+                headers=HEADERS, timeout=15,
+            )
+            r.raise_for_status()
+            for b in r.json().get("objects", []):
+                bid = b.get("id") or b.get("display_number")
+                if bid in seen:
+                    continue
+                seen.add(bid)
+                sponsor      = b.get("sponsor") or {}
+                sponsor_role = b.get("sponsor_role") or {}
+                party        = sponsor_role.get("party", "")
+                party_short  = {"Republican": "R", "Democrat": "D",
+                                "Independent": "I"}.get(party, party[:1] if party else "?")
+                hp, sp, sg   = _parse_bill_chambers(b)
+                bills.append({
+                    "bill_number":    b.get("display_number", ""),
+                    "title":          (b.get("title_without_number") or b.get("title") or "")[:90],
+                    "sponsor":        sponsor.get("name", "N/A"),
+                    "party":          party_short,
+                    "introduced":     b.get("introduced_date", ""),
+                    "status_date":    b.get("current_status_date", ""),
+                    "status":         b.get("current_status", ""),
+                    "status_label":   b.get("current_status_label", ""),
+                    "house_passed":   hp,
+                    "senate_passed":  sp,
+                    "signed":         sg,
+                    "link":           b.get("link", ""),
+                    "bill_type":      b.get("bill_type", ""),
+                })
+        except Exception:
+            break
+
+    return bills
+
+
+def _bg_bills():
+    if _legis_cache["loading"]:
+        return
+    _legis_cache["loading"] = True
+    try:
+        _legis_cache["data"]    = _fetch_bills()
+        _legis_cache["fetched"] = time.time()
+    finally:
+        _legis_cache["loading"] = False
+
+
+def _get_bills(force=False):
+    now   = time.time()
+    stale = force or now - _legis_cache["fetched"] > LEGIS_TTL or not _legis_cache["data"]
+    if stale and not _legis_cache["loading"]:
+        threading.Thread(target=_bg_bills, daemon=True).start()
+    return _legis_cache["data"]
+
+
 # ── JSON helper ──────────────────────────────────────────────────────────────────
 class _NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -611,6 +704,52 @@ async def portfolios_page():
     return PORTFOLIOS_HTML
 
 
+@app.get("/api/legis")
+async def api_legis(
+    chamber: str = Query("ALL"),
+    status:  str = Query("ALL"),
+    sort:    str = Query("date"),
+    dir:     str = Query("desc"),
+    q:       str = Query(""),
+):
+    rows = _get_bills()
+    if chamber == "HOUSE":
+        rows = [r for r in rows if r["bill_type"] in
+                ("house_bill","house_joint_resolution","house_concurrent_resolution","house_resolution")]
+    elif chamber == "SENATE":
+        rows = [r for r in rows if r["bill_type"] in
+                ("senate_bill","senate_joint_resolution","senate_concurrent_resolution","senate_resolution")]
+    if status == "SIGNED":
+        rows = [r for r in rows if r["signed"]]
+    elif status == "PASSED":
+        rows = [r for r in rows if r["house_passed"] and r["senate_passed"] and not r["signed"]]
+    elif status == "PROGRESS":
+        rows = [r for r in rows if (r["house_passed"] or r["senate_passed"]) and not (r["house_passed"] and r["senate_passed"])]
+    elif status == "INTRODUCED":
+        rows = [r for r in rows if not r["house_passed"] and not r["senate_passed"] and not r["signed"]]
+    if q:
+        qu = q.upper()
+        rows = [r for r in rows if qu in r["bill_number"].upper()
+                                or qu in r["title"].upper()
+                                or qu in r["sponsor"].upper()]
+    rev = (dir == "desc")
+    if   sort == "bill":    rows = sorted(rows, key=lambda r: r["bill_number"],  reverse=rev)
+    elif sort == "sponsor": rows = sorted(rows, key=lambda r: r["sponsor"],      reverse=rev)
+    else:                   rows = sorted(rows, key=lambda r: r["status_date"],  reverse=rev)
+    return _json({"bills": rows[:2000], "total": len(rows), "loading": _legis_cache["loading"]})
+
+
+@app.post("/api/legis/refresh")
+async def api_legis_refresh():
+    threading.Thread(target=_get_bills, kwargs={"force": True}, daemon=True).start()
+    return _json({"ok": True})
+
+
+@app.get("/legis", response_class=HTMLResponse)
+async def legis_page():
+    return LEGIS_HTML
+
+
 # ── HTML page ────────────────────────────────────────────────────────────────────
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -715,7 +854,7 @@ tbody tr:hover{background:#0d1535}
 <body>
 
 <div class="hdr">
-  <div class="nav"><a href="/" class="active">SCREENER</a><a href="/portfolios">PORTFOLIOS</a></div>
+  <div class="nav"><a href="/" class="active">SCREENER</a><a href="/portfolios">PORTFOLIOS</a><a href="/legis">LEGIS</a></div>
   <span class="title">&#9672; MOWAD INTELLIGENCE TERMINAL</span>
   <span class="subtitle">MULTI-FACTOR STOCK SCORING ENGINE</span>
   <span class="clock" id="clock"></span>
@@ -1143,6 +1282,218 @@ load();
 
 
 # ── Portfolios page ──────────────────────────────────────────────────────────────
+LEGIS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Legislation Tracker</title>
+<style>
+:root{
+  --bg:#02020c;--bg-row:#04061414;--bg-alt:#080b1b;
+  --hdr:#000212;--amber:#ffa000;--abright:#ffd23c;--adim:#825200;
+  --white:#e1e1ee;--muted:#4e536c;--green:#00e15f;--red:#ff3737;
+  --yellow:#ffd71e;--cyan:#37c3ff;--blue:#4fa3ff;--border:#162a50;
+  --btn:#0a193c;--btnhov:#142d64;--btnact:#234696;
+  --rep:#ff6b6b;--dem:#6b9fff;--ind:#b4ff6b;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{background:var(--bg);color:var(--white);
+  font-family:Consolas,'Lucida Console','Courier New',monospace;
+  font-size:13px;padding:12px 14px;display:flex;flex-direction:column}
+.nav{display:flex;gap:0;margin-bottom:6px;border-bottom:1px solid var(--border);flex-shrink:0}
+.nav a{color:var(--muted);text-decoration:none;padding:4px 14px;font-size:12px;letter-spacing:.6px;border-bottom:2px solid transparent;margin-bottom:-1px}
+.nav a:hover{color:var(--amber)}
+.nav a.active{color:var(--abright);border-bottom-color:var(--abright)}
+.hdr{display:flex;align-items:baseline;gap:20px;margin-bottom:3px}
+.title{color:var(--abright);font-size:19px;font-weight:bold;letter-spacing:.5px}
+.subtitle{color:var(--adim);font-size:12px}
+.clock{color:var(--muted);margin-left:auto;font-size:12px}
+.tagline{color:var(--adim);font-size:11px;margin-bottom:6px}
+hr{border:none;border-top:1px solid var(--border);margin:5px 0}
+.controls{display:flex;align-items:center;flex-wrap:wrap;gap:3px;padding:5px 0}
+.clabel{color:var(--muted);font-size:12px;margin:0 3px 0 8px}
+.clabel:first-child{margin-left:0}
+button{background:var(--btn);color:var(--white);border:1px solid var(--border);
+  padding:3px 9px;cursor:pointer;font-family:inherit;font-size:12px;height:24px}
+button:hover{background:var(--btnhov)}
+button.active{background:var(--btnact);border-color:var(--adim);color:var(--abright)}
+#search{background:#080c20;color:var(--white);border:1px solid var(--border);
+  padding:3px 8px;font-family:inherit;font-size:12px;width:200px;height:24px}
+#search::placeholder{color:var(--muted)}
+#search:focus{outline:1px solid var(--adim)}
+#lbl-status{color:var(--green);font-size:12px;margin-left:8px}
+.tbl-wrap{flex:1;overflow:auto;border:1px solid var(--border);min-height:0}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+thead tr{background:var(--hdr);position:sticky;top:0;z-index:5}
+th{color:var(--adim);text-align:left;padding:6px 8px;
+  border-right:1px solid var(--border);border-bottom:2px solid var(--border);
+  font-weight:normal;white-space:nowrap;font-size:12px}
+th.sortable{cursor:pointer}
+th.sortable:hover{color:var(--amber)}
+th.sort-active{color:var(--abright)}
+td{padding:4px 8px;border-right:1px solid #0d1830;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+tbody tr:nth-child(odd){background:var(--bg-row)}
+tbody tr:nth-child(even){background:var(--bg-alt)}
+tbody tr:hover{background:#0d1535}
+.cn{width:40px}.cb{width:110px}.ct{min-width:220px}.cs{width:190px}
+.ci{width:96px}.ch{width:56px}.csen{width:58px}.csg{width:56px}
+.mc{color:var(--muted)}.bc{color:var(--abright)}.tc{color:var(--white)}
+.sc{color:var(--white)}.dc{color:var(--muted)}
+.chk-y{color:var(--green);font-size:15px;text-align:center}
+.chk-n{color:var(--muted);text-align:center}
+.party-r{color:var(--rep)}
+.party-d{color:var(--dem)}
+.party-i{color:var(--ind)}
+.sbar{display:flex;gap:30px;padding:4px 0;font-size:11px;color:var(--muted);flex-shrink:0}
+a.bill-link{color:var(--abright);text-decoration:none}
+a.bill-link:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="nav">
+  <a href="/">SCREENER</a>
+  <a href="/portfolios">PORTFOLIOS</a>
+  <a href="/legis" class="active">LEGIS</a>
+</div>
+<div class="hdr">
+  <span class="title">&#9672; LEGISLATION TRACKER</span>
+  <span class="subtitle">119TH U.S. CONGRESS &middot; BILL STATUS</span>
+  <span class="clock" id="clock"></span>
+</div>
+<div class="tagline">&nbsp;Source: GovTrack.us &mdash; Most recently active bills</div>
+<div class="controls">
+  <span class="clabel">ORIGIN:</span>
+  <button class="active" data-group="chamber" data-val="ALL"  onclick="setFilter(this)">ALL</button>
+  <button                data-group="chamber" data-val="HOUSE"   onclick="setFilter(this)">HOUSE</button>
+  <button                data-group="chamber" data-val="SENATE"  onclick="setFilter(this)">SENATE</button>
+  &nbsp;
+  <span class="clabel">STATUS:</span>
+  <button class="active" data-group="status" data-val="ALL"         onclick="setFilter(this)">ALL</button>
+  <button                data-group="status" data-val="INTRODUCED"  onclick="setFilter(this)">INTRODUCED</button>
+  <button                data-group="status" data-val="PROGRESS"    onclick="setFilter(this)">IN PROGRESS</button>
+  <button                data-group="status" data-val="PASSED"      onclick="setFilter(this)">PASSED BOTH</button>
+  <button                data-group="status" data-val="SIGNED"      onclick="setFilter(this)">SIGNED</button>
+  &nbsp;
+  <input id="search" type="text" placeholder="Search bill, title, sponsor..." oninput="debounceSearch()">
+  <button onclick="doRefresh()">&#8635; REFRESH</button>
+  <span id="lbl-status">&nbsp;READY</span>
+</div>
+<hr>
+<div class="tbl-wrap">
+  <table id="data-table">
+    <thead><tr>
+      <th class="cn">#</th>
+      <th class="cb sortable sort-active" data-sort="date" onclick="thSort(this)">BILL &#9660;</th>
+      <th class="ct">TITLE</th>
+      <th class="cs sortable" data-sort="sponsor" onclick="thSort(this)">SPONSOR</th>
+      <th class="ci sortable" data-sort="date" onclick="thSort(this)">INTRODUCED</th>
+      <th class="ch" style="text-align:center">HOUSE</th>
+      <th class="csen" style="text-align:center">SENATE</th>
+      <th class="csg" style="text-align:center">SIGNED</th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+<hr>
+<div class="sbar">
+  <span id="lbl-count"></span>
+  <span id="lbl-updated"></span>
+</div>
+
+<script>
+const S={chamber:'ALL',status:'ALL',sortKey:'date',sortDir:'desc',search:''};
+let searchTimer=null;
+
+function tick(){const n=new Date();document.getElementById('clock').textContent=n.toTimeString().slice(0,8);}
+setInterval(tick,1000);tick();
+
+function setFilter(btn){
+  const g=btn.dataset.group,v=btn.dataset.val;
+  document.querySelectorAll(`[data-group="${g}"]`).forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  if(g==='chamber') S.chamber=v;
+  if(g==='status')  S.status=v;
+  fetchAndRender();
+}
+
+function thSort(th){
+  const k=th.dataset.sort;
+  if(S.sortKey===k) S.sortDir=S.sortDir==='desc'?'asc':'desc';
+  else{S.sortKey=k;S.sortDir='desc';}
+  document.querySelectorAll('th.sort-active').forEach(t=>t.classList.remove('sort-active'));
+  th.classList.add('sort-active');
+  fetchAndRender();
+}
+
+function debounceSearch(){
+  clearTimeout(searchTimer);
+  searchTimer=setTimeout(()=>{S.search=document.getElementById('search').value;fetchAndRender();},300);
+}
+
+function chk(val){
+  return val
+    ? '<span class="chk-y">&#10003;</span>'
+    : '<span class="chk-n">&ndash;</span>';
+}
+
+function partyCls(p){
+  if(p==='R') return 'party-r';
+  if(p==='D') return 'party-d';
+  return 'party-i';
+}
+
+let legisPoller=null;
+
+async function fetchAndRender(){
+  const p=new URLSearchParams({chamber:S.chamber,status:S.status,sort:S.sortKey,dir:S.sortDir,q:S.search});
+  const r=await fetch('/api/legis?'+p);
+  const d=await r.json();
+  renderTable(d.bills, d.total, d.loading);
+  clearTimeout(legisPoller);
+  if(d.loading) legisPoller=setTimeout(fetchAndRender,4000);
+  document.getElementById('lbl-updated').textContent='  Updated: '+new Date().toTimeString().slice(0,8);
+}
+
+function renderTable(rows, total, loading){
+  const st=document.getElementById('lbl-status');
+  if(loading){st.textContent='  LOADING...';st.style.color='var(--amber)';}
+  else{st.textContent='  READY';st.style.color='var(--green)';}
+  document.getElementById('lbl-count').textContent=`  Showing ${rows.length} of ${total} bills`;
+  const tbody=document.getElementById('tbody');
+  if(!rows.length){
+    tbody.innerHTML=`<tr><td colspan="8" style="color:var(--muted);padding:20px">&nbsp;${loading?'Fetching bill data from GovTrack...':'No bills match the current filters.'}</td></tr>`;
+    return;
+  }
+  tbody.innerHTML=rows.map((r,i)=>`<tr>
+    <td class="cn mc">&nbsp;${i+1}</td>
+    <td class="cb bc">&nbsp;<a class="bill-link" href="${r.link}" target="_blank">${r.bill_number}</a></td>
+    <td class="ct tc" title="${r.title}">&nbsp;${r.title}</td>
+    <td class="cs" style="color:inherit">&nbsp;<span class="${partyCls(r.party)}">[${r.party}]</span> ${r.sponsor}</td>
+    <td class="ci dc">&nbsp;${r.introduced}</td>
+    <td class="ch" style="text-align:center">${chk(r.house_passed)}</td>
+    <td class="csen" style="text-align:center">${chk(r.senate_passed)}</td>
+    <td class="csg" style="text-align:center">${chk(r.signed)}</td>
+  </tr>`).join('');
+}
+
+async function doRefresh(){
+  document.getElementById('lbl-status').textContent='  REFRESHING...';
+  document.getElementById('lbl-status').style.color='var(--amber)';
+  await fetch('/api/legis/refresh',{method:'POST'});
+  await new Promise(r=>setTimeout(r,2000));
+  await fetchAndRender();
+  document.getElementById('lbl-status').textContent='  READY';
+  document.getElementById('lbl-status').style.color='var(--green)';
+}
+
+fetchAndRender();
+</script>
+</body>
+</html>"""
+
+
 PORTFOLIOS_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1218,6 +1569,7 @@ tbody tr:hover{background:#0d1535}
 <div class="nav">
   <a href="/">SCREENER</a>
   <a href="/portfolios" class="active">PORTFOLIOS</a>
+  <a href="/legis">LEGIS</a>
 </div>
 <div class="hdr">
   <span class="title">&#9672; GOVERNMENT PORTFOLIOS</span>
@@ -1378,5 +1730,6 @@ async def index():
 if __name__ == "__main__":
     trigger_refresh()
     threading.Thread(target=_bg_congress, daemon=True).start()
+    threading.Thread(target=_bg_bills,   daemon=True).start()
     uvicorn.run(app, host="127.0.0.1", port=8888, log_level="warning")
 ###Stop-Process -Id (Get-NetTCPConnection -LocalPort 8888).OwningProcess -Force
