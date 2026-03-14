@@ -25,15 +25,29 @@ YAHOO_CHART_URL  = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 NEWS_RSS_URL     = "https://finance.yahoo.com/news/rss"
 
 LAUNCHPAD_INDICES = [
-    ("^DJI",     "DOW JONES"),
-    ("^GSPC",    "S&P 500"),
-    ("^IXIC",    "NASDAQ"),
-    ("^RUT",     "RUSSELL 2K"),
-    ("^VIX",     "VIX"),
-    ("^TNX",     "10Y YIELD"),
-    ("GC=F",     "GOLD"),
-    ("CL=F",     "CRUDE OIL"),
-    ("BTC-USD",  "BITCOIN"),
+    # symbol=None → section header row (no fetch)
+    (None,        "── INDICES ──"),
+    ("^DJI",      "DOW JONES"),
+    ("^GSPC",     "S&P 500"),
+    ("^IXIC",     "NASDAQ"),
+    ("^RUT",      "RUSSELL 2K"),
+    ("^VIX",      "VIX"),
+    ("^TNX",      "10Y YIELD"),
+    (None,        "── COMMODITIES ──"),
+    ("GC=F",      "GOLD"),
+    ("SI=F",      "SILVER"),
+    ("CL=F",      "CRUDE OIL"),
+    ("NG=F",      "NAT GAS"),
+    ("HG=F",      "COPPER"),
+    (None,        "── CURRENCIES ──"),
+    ("DX-Y.NYB",  "USD INDEX"),
+    ("EURUSD=X",  "EUR / USD"),
+    ("GBPUSD=X",  "GBP / USD"),
+    ("JPY=X",     "USD / JPY"),
+    ("CHFUSD=X",  "USD / CHF"),
+    (None,        "── CRYPTO ──"),
+    ("BTC-USD",   "BITCOIN"),
+    ("ETH-USD",   "ETHEREUM"),
 ]
 
 SECTORS = [
@@ -647,28 +661,33 @@ def _fetch_quote(symbol):
 
 
 def _fetch_home_data():
-    indices, sectors = [], []
+    sectors = []
+    # Only fetch entries that have a real symbol (skip section headers where sym=None)
+    fetchable = [(sym, name) for sym, name in LAUNCHPAD_INDICES if sym is not None]
+    fetched   = {}
     with ThreadPoolExecutor(max_workers=20) as pool:
-        idx_futs = {pool.submit(_fetch_quote, sym): (sym, name) for sym, name in LAUNCHPAD_INDICES}
+        idx_futs = {pool.submit(_fetch_quote, sym): (sym, name) for sym, name in fetchable}
         sec_futs = {pool.submit(_fetch_quote, sym): (sym, name) for sym, name in SECTORS}
         for fut, (sym, name) in idx_futs.items():
             try:
                 price, chg, pct = fut.result()
-                indices.append({"symbol": sym, "name": name,
-                                 "price": price, "chg": chg, "pct": pct})
+                fetched[sym] = {"symbol": sym, "name": name, "price": price, "chg": chg, "pct": pct}
             except Exception:
-                indices.append({"symbol": sym, "name": name, "price": 0, "chg": 0, "pct": 0})
+                fetched[sym] = {"symbol": sym, "name": name, "price": 0, "chg": 0, "pct": 0}
         for fut, (sym, name) in sec_futs.items():
             try:
                 price, chg, pct = fut.result()
-                sectors.append({"symbol": sym, "name": name,
-                                 "price": price, "chg": chg, "pct": pct})
+                sectors.append({"symbol": sym, "name": name, "price": price, "chg": chg, "pct": pct})
             except Exception:
                 sectors.append({"symbol": sym, "name": name, "price": 0, "chg": 0, "pct": 0})
-    # Preserve defined order
-    idx_order = {sym: i for i, (sym, _) in enumerate(LAUNCHPAD_INDICES)}
+    # Rebuild indices list in defined order, inserting section headers
+    indices = []
+    for sym, name in LAUNCHPAD_INDICES:
+        if sym is None:
+            indices.append({"symbol": None, "name": name, "header": True})
+        elif sym in fetched:
+            indices.append(fetched[sym])
     sec_order = {sym: i for i, (sym, _) in enumerate(SECTORS)}
-    indices.sort(key=lambda x: idx_order.get(x["symbol"], 99))
     sectors.sort(key=lambda x: sec_order.get(x["symbol"], 99))
     # Top signals from screener
     all_stocks  = list(_state["stocks"].values())
@@ -1069,7 +1088,9 @@ function renderMarket(rows){
   if(!rows.length){document.getElementById('mkt-body').innerHTML='<div class="loading">&nbsp; No data.</div>';return;}
   document.getElementById('mkt-body').innerHTML=`
     <table class="idx-table">
-      ${rows.map(r=>`<tr>
+      ${rows.map(r=>r.header?`<tr>
+        <td colspan="4" style="color:#f0b429;font-size:11px;padding:4px 2px 2px 4px;letter-spacing:1px;opacity:0.8;">${r.name}</td>
+      </tr>`:`<tr>
         <td class="idx-name">&nbsp;${r.name}</td>
         <td class="idx-price">${fmtPrice(r.price,r.symbol)}</td>
         <td class="idx-chg ${pctCls(r.chg)}">${sign(r.chg)}${r.chg.toFixed(2)}</td>
