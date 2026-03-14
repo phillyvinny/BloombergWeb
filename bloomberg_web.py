@@ -1523,7 +1523,7 @@ tbody tr:hover{background:#0d1535}
       <th class="c5">MACD /20</th>
       <th class="c6">RSI&nbsp;&nbsp;/20</th>
       <th class="c7">TREND/20</th>
-      <th class="c8">ANLYST/20</th>
+      <th class="c8"><a href="https://www.tipranks.com" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;" title="Analyst ratings via TipRanks">ANLYST/20 &#x1F517;</a></th>
       <th class="c9 sortable sort-active" id="th-score" data-sort="score" onclick="thSort(this)">SCORE &#9660;</th>
       <th class="c10">SIGNAL</th>
       <th class="c11">IDX</th>
@@ -1627,8 +1627,9 @@ function renderTable(rows, totalLoaded){
 
   tbody.innerHTML=rows.map((s,i)=>{
     const am=s.analyst_mean;
+    const tipranks=`https://www.tipranks.com/stocks/${s.symbol.toLowerCase()}/analyst-ratings`;
     const aBars=am!=null?`${s.bar_analyst}&nbsp;${String(s.analyst_s).padStart(2)}/20`
-                        :`${s.bar_analyst}&nbsp;&nbsp;N/A`;
+                        :`${s.bar_analyst}&nbsp;&nbsp;<a href="${tipranks}" target="_blank" rel="noopener" title="View analyst ratings on TipRanks" style="color:var(--abright);text-decoration:none;">N/A &#x1F517;</a>`;
     return `<tr>
       <td class="c0 mc">&nbsp;${i+1}</td>
       <td class="c1 tc ticker-cell" onclick="openChart('${s.symbol}')" title="Click to open chart">&nbsp;${s.symbol}</td>
