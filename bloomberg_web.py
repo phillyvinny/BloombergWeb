@@ -6,7 +6,12 @@ Run:  python bloomberg_web.py   →   open http://localhost:8000
 
 import io
 import json
+import os
 import re
+import signal
+import socket
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2264,9 +2269,28 @@ async def index():
     return LAUNCHPAD_HTML
 
 
+def _free_port(port: int):
+    """Kill whatever process is holding the given port, so startup never fails."""
+    try:
+        result = subprocess.check_output(
+            f'netstat -ano | findstr ":{port} "', shell=True, text=True
+        )
+        for line in result.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and f":{port}" in parts[1] and parts[3] == "LISTENING":
+                pid = int(parts[4])
+                if pid > 4:  # skip System/Idle
+                    subprocess.call(f"taskkill /PID {pid} /F", shell=True,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print(f"[startup] Freed port {port} (killed PID {pid})")
+                    time.sleep(0.5)
+    except Exception:
+        pass  # port was already free
+
+
 if __name__ == "__main__":
+    _free_port(8888)
     trigger_refresh()
     threading.Thread(target=_bg_congress, daemon=True).start()
     threading.Thread(target=_bg_bills,   daemon=True).start()
     uvicorn.run(app, host="127.0.0.1", port=8888, log_level="warning")
-###Stop-Process -Id (Get-NetTCPConnection -LocalPort 8888).OwningProcess -Force
