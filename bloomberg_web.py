@@ -914,59 +914,59 @@ LAUNCHPAD_HTML = """<!DOCTYPE html>
 html,body{height:100%;overflow:hidden}
 body{background:var(--bg);color:var(--white);
   font-family:Consolas,'Lucida Console','Courier New',monospace;
-  font-size:12px;display:flex;flex-direction:column;padding:8px 10px}
+  font-size:16px;display:flex;flex-direction:column;padding:8px 10px}
 .nav{display:flex;gap:0;margin-bottom:5px;border-bottom:1px solid var(--border);flex-shrink:0}
-.nav a{color:var(--muted);text-decoration:none;padding:4px 14px;font-size:12px;
+.nav a{color:var(--muted);text-decoration:none;padding:4px 14px;font-size:14px;
   letter-spacing:.6px;border-bottom:2px solid transparent;margin-bottom:-1px}
 .nav a:hover{color:var(--amber)}
 .nav a.active{color:var(--abright);border-bottom-color:var(--abright)}
 .top-bar{display:flex;align-items:baseline;gap:16px;margin-bottom:5px;flex-shrink:0}
-.brand{color:var(--abright);font-size:17px;font-weight:bold;letter-spacing:1px}
-.tagline{color:var(--adim);font-size:11px}
-.clock{margin-left:auto;color:var(--muted);font-size:12px}
-.grid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;
+.brand{color:var(--abright);font-size:21px;font-weight:bold;letter-spacing:1px}
+.tagline{color:var(--adim);font-size:14px}
+.clock{margin-left:auto;color:var(--muted);font-size:15px}
+.grid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:2fr 1fr;
   gap:8px;flex:1;min-height:0}
 .panel{background:var(--panel);border:1px solid var(--border);
   display:flex;flex-direction:column;overflow:hidden}
-.panel-hdr{background:var(--hdr);padding:5px 10px;font-size:11px;letter-spacing:.8px;
+.panel-hdr{background:var(--hdr);padding:6px 10px;font-size:14px;letter-spacing:.8px;
   color:var(--adim);border-bottom:1px solid var(--border);flex-shrink:0;
   display:flex;align-items:center;gap:8px}
-.panel-hdr .dot{color:var(--abright);font-size:14px}
-.panel-hdr .sub{margin-left:auto;color:var(--muted);font-size:10px}
+.panel-hdr .dot{color:var(--abright);font-size:16px}
+.panel-hdr .sub{margin-left:auto;color:var(--muted);font-size:12px}
 .panel-body{flex:1;overflow:auto;padding:0}
 /* Market Monitor */
 .idx-table{width:100%;border-collapse:collapse}
 .idx-table td{padding:4px 10px;border-bottom:1px solid #0a1428;white-space:nowrap}
 .idx-table tr:hover td{background:#071230}
-.idx-name{color:var(--muted);width:110px;font-size:11px;letter-spacing:.3px}
-.idx-price{color:var(--white);text-align:right;width:90px;font-size:12px}
-.idx-chg{text-align:right;width:80px;font-size:11px}
-.idx-pct{text-align:right;width:70px;font-size:12px;font-weight:bold}
+.idx-name{color:var(--muted);width:130px;font-size:14px;letter-spacing:.3px}
+.idx-price{color:var(--white);text-align:right;width:110px;font-size:15px}
+.idx-chg{text-align:right;width:90px;font-size:14px}
+.idx-pct{text-align:right;width:80px;font-size:15px;font-weight:bold}
 .pos{color:var(--green)}.neg{color:var(--red)}.flat{color:var(--muted)}
 /* Sector chart */
-.chart-wrap{flex:1;padding:8px;display:flex;align-items:center;justify-content:center;min-height:0}
-canvas{max-height:100%;max-width:100%}
+.chart-wrap{flex:1;padding:8px;display:flex;align-items:stretch;justify-content:center;min-height:0;position:relative}
+canvas{width:100%!important;height:100%!important}
 /* Top Signals */
 .sig-table{width:100%;border-collapse:collapse}
 .sig-table td{padding:4px 8px;border-bottom:1px solid #0a1428;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sig-table tr:hover td{background:#071230}
-.sig-ticker{color:var(--abright);width:54px;font-weight:bold}
-.sig-name{color:var(--white);max-width:140px;overflow:hidden;text-overflow:ellipsis}
-.sig-score{text-align:right;color:var(--cyan);width:38px}
-.sig-rsi{text-align:right;color:var(--muted);width:40px;font-size:11px}
-.sig-buy{color:var(--green);font-size:11px;text-align:center;width:50px;font-weight:bold}
-.sig-watch{color:var(--amber);font-size:11px;text-align:center;width:50px}
+.sig-ticker{color:var(--abright);width:62px;font-weight:bold}
+.sig-name{color:var(--white);max-width:160px;overflow:hidden;text-overflow:ellipsis}
+.sig-score{text-align:right;color:var(--cyan);width:44px}
+.sig-rsi{text-align:right;color:var(--muted);width:46px;font-size:14px}
+.sig-buy{color:var(--green);font-size:14px;text-align:center;width:58px;font-weight:bold}
+.sig-watch{color:var(--amber);font-size:14px;text-align:center;width:58px}
 /* News */
 .news-list{padding:2px 0}
 .news-item{padding:5px 10px;border-bottom:1px solid #0a1428;cursor:pointer}
 .news-item:hover{background:#071230}
-.news-time{color:var(--adim);font-size:10px;margin-bottom:2px}
-.news-title{color:var(--white);font-size:11px;line-height:1.4;
+.news-time{color:var(--adim);font-size:13px;margin-bottom:2px}
+.news-title{color:var(--white);font-size:14px;line-height:1.4;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .news-item a{color:inherit;text-decoration:none}
 .news-item a:hover .news-title{color:var(--abright)}
 /* Loading */
-.loading{color:var(--adim);padding:20px 10px;font-size:11px}
+.loading{color:var(--adim);padding:20px 10px;font-size:14px}
 </style>
 </head>
 <body>
@@ -1099,7 +1099,7 @@ function renderSectors(sectors){
     data:{
       labels,
       datasets:[{
-        data: pcts.map(p=>Math.max(Math.abs(p),0.3)),
+        data: pcts.map(p=>Math.max(Math.abs(p),0.4)),
         backgroundColor: colors,
         borderColor:'#0d1830',
         borderWidth:1,
@@ -1107,13 +1107,14 @@ function renderSectors(sectors){
     },
     options:{
       responsive:true,
+      maintainAspectRatio:false,
       plugins:{
         legend:{
           position:'right',
           labels:{
-            color:'#a0a8c0',
-            font:{family:"Consolas,'Courier New',monospace",size:10},
-            boxWidth:10,padding:6,
+            color:'#ffffff',
+            font:{family:"Consolas,'Courier New',monospace",size:13},
+            boxWidth:13,padding:8,
             generateLabels(chart){
               return chart.data.labels.map((label,i)=>{
                 const pct=pcts[i];
@@ -1132,8 +1133,8 @@ function renderSectors(sectors){
       },
       scales:{r:{
         ticks:{display:false},
-        grid:{color:'#0d1830'},
-        angleLines:{color:'#0d1830'},
+        grid:{color:'#1a2840'},
+        angleLines:{color:'#1a2840'},
       }}
     }
   });
@@ -1144,11 +1145,11 @@ function renderSignals(sigs){
   document.getElementById('sig-body').innerHTML=`
     <table class="sig-table">
       <thead><tr style="background:#000212">
-        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:10px">TICKER</th>
-        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:10px">COMPANY</th>
-        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:10px;text-align:right">SCORE</th>
-        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:10px;text-align:right">RSI</th>
-        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:10px;text-align:center">SIG</th>
+        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:13px">TICKER</th>
+        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:13px">COMPANY</th>
+        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:13px;text-align:right">SCORE</th>
+        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:13px;text-align:right">RSI</th>
+        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:13px;text-align:center">SIG</th>
       </tr></thead>
       <tbody>
       ${sigs.map(s=>`<tr onclick="window.open('/chart/${s.symbol}','_blank')" style="cursor:pointer">
