@@ -388,8 +388,10 @@ def _compute_chart_data(sym):
 
 
 # ── Congressional Trading Data ───────────────────────────────────────────────────
-HOUSE_PTR_SEARCH = "https://disclosures-clerk.house.gov/FinancialDisclosure/ViewMemberSearchResult"
-HOUSE_PTR_BASE   = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs"
+HOUSE_PTR_SEARCH  = "https://disclosures-clerk.house.gov/FinancialDisclosure/ViewMemberSearchResult"
+HOUSE_PTR_BASE    = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs"
+SENATE_EFD_SEARCH = "https://efts.senate.gov/LATEST/search-index"
+SENATE_EFD_DOC    = "https://efts.senate.gov/LATEST/search-index/{fid}/document"
 
 _AMOUNT_RANK = {
     "$1,001 - $15,000": 1,      "$15,001 - $50,000": 2,
@@ -516,13 +518,78 @@ def _fetch_congress_trades():
     return rows
 
 
+def _fetch_senate_trades():
+    """Fetch Senate PTRs from eFD public API. Returns list of trade dicts."""
+    year  = datetime.now().year
+    years = [year, year - 1] if datetime.now().month < 4 else [year]
+    rows  = []
+    for yr in years:
+        page = 1
+        while True:
+            try:
+                r = requests.get(
+                    SENATE_EFD_SEARCH,
+                    params={
+                        "q":          '""',
+                        "dateFrom":   f"{yr}-01-01",
+                        "dateTo":     f"{yr}-12-31",
+                        "transactionType": "ST",
+                        "pageSize":   200,
+                        "page":       page,
+                    },
+                    headers=HEADERS, timeout=30,
+                )
+                r.raise_for_status()
+                data = r.json()
+                hits = data.get("hits", {}).get("hits", [])
+                if not hits:
+                    break
+                for h in hits:
+                    s   = h.get("_source", {})
+                    fid = h.get("_id", "")
+                    fname = (s.get("first_name") or "").strip()
+                    lname = (s.get("last_name")  or "").strip()
+                    name  = f"{fname} {lname}".strip() or "Unknown"
+                    ticker  = (s.get("ticker")           or "").upper().strip()
+                    company = (s.get("asset_name")       or "")[:48].strip()
+                    raw_type = (s.get("transaction_type") or "").upper()
+                    tx_type  = "PURCHASE" if "PURCH" in raw_type or raw_type == "P" else "SALE" if "SALE" in raw_type or raw_type == "S" else raw_type
+                    amount   = (s.get("amount") or "").strip()
+                    tx_date  = (s.get("transaction_date") or s.get("document_date") or "")[:10]
+                    if not ticker or not tx_date:
+                        continue
+                    rows.append({
+                        "chamber":          "SENATE",
+                        "name":             name,
+                        "ticker":           ticker,
+                        "company":          company,
+                        "trade_type":       tx_type,
+                        "amount":           amount,
+                        "amount_rank":      _AMOUNT_RANK.get(amount, 0),
+                        "transaction_date": tx_date,
+                        "disclosure_date":  (s.get("document_date") or "")[:10],
+                        "source_url":       SENATE_EFD_DOC.format(fid=fid) if fid else "",
+                    })
+                total = data.get("hits", {}).get("total", {}).get("value", 0)
+                if page * 200 >= total:
+                    break
+                page += 1
+            except Exception:
+                break
+    return rows
+
+
 def _bg_congress():
-    """Background worker: fetch all congress trades and populate cache."""
+    """Background worker: fetch House + Senate trades and populate cache."""
     if _congress_cache["loading"]:
         return
     _congress_cache["loading"] = True
     try:
-        _congress_cache["data"]    = _fetch_congress_trades()
+        house  = _fetch_congress_trades()
+        senate = _fetch_senate_trades()
+        combined = house + senate
+        combined.sort(key=lambda x: x["transaction_date"], reverse=True)
+        _congress_cache["data"]    = combined
         _congress_cache["fetched"] = time.time()
     finally:
         _congress_cache["loading"] = False
