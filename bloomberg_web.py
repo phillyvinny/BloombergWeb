@@ -7,6 +7,7 @@ Run:  python bloomberg_web.py   →   open http://localhost:8000
 import io
 import json
 import os
+from pathlib import Path
 import re
 import signal
 import socket
@@ -74,10 +75,12 @@ HEADERS          = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
-REFRESH_INTERVAL  = 300
+REFRESH_INTERVAL  = 1800           # 30 min — full screener refresh
 MAX_WORKERS       = 20
 SCORE_BUY         = 65
 SCORE_WATCH       = 40
+SCREENER_CACHE    = Path(__file__).parent / "screener_cache.json"
+CACHE_MAX_AGE     = 14 * 3600     # serve disk cache up to 14 hours old
 
 # ── Universe ─────────────────────────────────────────────────────────────────────
 DOW_30 = [
@@ -305,6 +308,25 @@ def _bg_refresh():
     _state["last_updated"] = datetime.now().strftime("%H:%M:%S")
     _state["loading"]      = False
     _state["next_refresh"] = time.time() + REFRESH_INTERVAL
+    # Persist to disk so next restart is instant
+    try:
+        with open(SCREENER_CACHE, "w") as f:
+            json.dump(stocks, f)
+    except Exception:
+        pass
+
+
+def _load_disk_cache():
+    """Load screener data from disk cache if it exists and is fresh enough."""
+    try:
+        if SCREENER_CACHE.exists():
+            age = time.time() - SCREENER_CACHE.stat().st_mtime
+            if age < CACHE_MAX_AGE:
+                with open(SCREENER_CACHE) as f:
+                    return json.load(f)
+    except Exception:
+        pass
+    return None
 
 
 def trigger_refresh():
@@ -2416,6 +2438,13 @@ def _free_port(port: int):
 
 if __name__ == "__main__":
     _free_port(8888)
+    # Load cached screener data so the UI is usable immediately on restart
+    cached = _load_disk_cache()
+    if cached:
+        _state["stocks"]       = cached
+        _state["last_updated"] = "cached"
+        _state["loaded"]       = len(cached)
+        print(f"[startup] Loaded {len(cached)} stocks from disk cache — refreshing in background")
     trigger_refresh()
     threading.Thread(target=_bg_congress, daemon=True).start()
     threading.Thread(target=_bg_bills,   daemon=True).start()
