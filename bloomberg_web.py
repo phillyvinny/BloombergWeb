@@ -41,29 +41,17 @@ POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "OehRygcqWPd78jOSWTBgfhu9oCs
 
 LAUNCHPAD_INDICES = [
     # symbol=None → section header row (no fetch)
-    # Stocks/ETFs use Polygon stock snapshot; C: = forex; X: = crypto
-    (None,         "── INDICES ──"),
-    ("DIA",        "DOW JONES"),      # Dow Jones ETF
-    ("SPY",        "S&P 500"),        # S&P 500 ETF
-    ("QQQ",        "NASDAQ"),         # NASDAQ ETF
-    ("IWM",        "RUSSELL 2K"),     # Russell 2000 ETF
-    ("VIXY",       "VIX"),            # VIX ETF
-    ("TLT",        "10Y YIELD"),      # 20yr Treasury ETF
-    (None,         "── COMMODITIES ──"),
-    ("GLD",        "GOLD"),           # Gold ETF
-    ("SLV",        "SILVER"),         # Silver ETF
-    ("USO",        "CRUDE OIL"),      # Crude Oil ETF
-    ("UNG",        "NAT GAS"),        # Nat Gas ETF
-    ("COPX",       "COPPER"),         # Copper ETF
-    (None,         "── CURRENCIES ──"),
-    ("UUP",        "USD INDEX"),      # USD Index ETF
-    ("C:EURUSD",   "EUR / USD"),
-    ("C:GBPUSD",   "GBP / USD"),
-    ("C:USDJPY",   "USD / JPY"),
-    ("C:USDCHF",   "USD / CHF"),
-    (None,         "── CRYPTO ──"),
-    ("X:BTCUSD",   "BITCOIN"),
-    ("X:ETHUSD",   "ETHEREUM"),
+    # All symbols are US equity ETFs — last close shown when market is closed
+    (None,   "── INDICES ──"),
+    ("DIA",  "DOW JONES"),
+    ("SPY",  "S&P 500"),
+    ("QQQ",  "NASDAQ"),
+    ("IWM",  "RUSSELL 2K"),
+    ("VIXY", "VIX"),
+    ("TLT",  "10Y YIELD"),
+    (None,   "── CRYPTO ──"),
+    ("X:BTCUSD", "BITCOIN"),
+    ("X:ETHUSD", "ETHEREUM"),
 ]
 
 SECTORS = [
@@ -87,10 +75,9 @@ HEADERS          = {
     )
 }
 REFRESH_INTERVAL  = 300
-MAX_WORKERS       = 5    # keep within Polygon rate limits
+MAX_WORKERS       = 20
 SCORE_BUY         = 65
 SCORE_WATCH       = 40
-_POLY_SEMAPHORE   = threading.Semaphore(5)  # max 5 concurrent Polygon calls
 
 # ── Universe ─────────────────────────────────────────────────────────────────────
 DOW_30 = [
@@ -745,16 +732,17 @@ NEWS_TTL    = 300
 
 
 def _fetch_quote(symbol):
-    """Fetch last-close price + daily change via Polygon aggregates.
-    Using daily bars (last 2 trading days) works correctly whether the
-    market is open, closed, or it's a weekend — no snapshot zeros."""
+    """Fetch last-close price + daily change via Polygon daily aggregates.
+    Works for US equity ETFs (plain tickers) and crypto (X: prefix).
+    Uses last 2 trading bars so market-closed days show the correct last close."""
     today     = date.today()
-    from_date = str(today - timedelta(days=10))  # 10 cal days → at least 2 trading days
-    to_date   = str(today)
-    extra = {} if symbol.startswith(("X:", "C:")) else {"adjusted": "true"}
-    raw   = _poly_get(
-        f"{POLYGON_BASE}/v2/aggs/ticker/{symbol}/range/1/day/{from_date}/{to_date}",
-        params={"sort": "asc", "limit": 10, **extra},
+    from_date = str(today - timedelta(days=10))
+    params    = {"sort": "asc", "limit": 10}
+    if not symbol.startswith("X:"):
+        params["adjusted"] = "true"
+    raw  = _poly_get(
+        f"{POLYGON_BASE}/v2/aggs/ticker/{symbol}/range/1/day/{from_date}/{today}",
+        params=params,
     )
     bars  = [b for b in (raw.get("results") or []) if b.get("c") is not None]
     if not bars:
