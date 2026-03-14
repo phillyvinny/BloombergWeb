@@ -487,6 +487,7 @@ def _parse_ptr_pdf(doc_id, year):
                 "amount_rank":      _AMOUNT_RANK.get(amount, 0),
                 "transaction_date": iso_date,
                 "disclosure_date":  "",
+                "source_url":       f"{HOUSE_PTR_BASE}/{year}/{doc_id}.pdf",
             })
         return trades
     except Exception:
@@ -2238,7 +2239,9 @@ function renderTable(rows, total, loading){
   }
   tbody.innerHTML=rows.map((r,i)=>`<tr>
     <td class="cn mc">&nbsp;${i+1}</td>
-    <td class="cc nc">&nbsp;${r.name}</td>
+    <td class="cc nc">&nbsp;${r.source_url
+      ? `<a href="${r.source_url}" target="_blank" rel="noopener" title="View source disclosure PDF" style="color:var(--abright);text-decoration:none;">${r.name} &#x1F517;</a>`
+      : r.name}</td>
     <td class="ch hc">&nbsp;${r.chamber}</td>
     <td class="ct tc">&nbsp;${r.ticker}</td>
     <td class="co nc">&nbsp;${r.company}</td>
