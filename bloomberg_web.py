@@ -22,6 +22,33 @@ from pypdf import PdfReader
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 YAHOO_CHART_URL  = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+NEWS_RSS_URL     = "https://finance.yahoo.com/news/rss"
+
+LAUNCHPAD_INDICES = [
+    ("^DJI",     "DOW JONES"),
+    ("^GSPC",    "S&P 500"),
+    ("^IXIC",    "NASDAQ"),
+    ("^RUT",     "RUSSELL 2K"),
+    ("^VIX",     "VIX"),
+    ("^TNX",     "10Y YIELD"),
+    ("GC=F",     "GOLD"),
+    ("CL=F",     "CRUDE OIL"),
+    ("BTC-USD",  "BITCOIN"),
+]
+
+SECTORS = [
+    ("XLK",  "Technology"),
+    ("XLF",  "Financials"),
+    ("XLV",  "Health Care"),
+    ("XLE",  "Energy"),
+    ("XLC",  "Communication"),
+    ("XLI",  "Industrials"),
+    ("XLY",  "Cons. Disc."),
+    ("XLP",  "Cons. Staples"),
+    ("XLB",  "Materials"),
+    ("XLRE", "Real Estate"),
+    ("XLU",  "Utilities"),
+]
 HEADERS          = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -597,6 +624,105 @@ def _json(data):
         media_type="application/json",
     )
 
+# ── Launchpad / Home Data ────────────────────────────────────────────────────────
+_home_cache = {"data": {}, "fetched": 0.0}
+_news_cache = {"data": [], "fetched": 0.0}
+HOME_TTL    = 300   # 5 min
+NEWS_TTL    = 300
+
+
+def _fetch_quote(symbol):
+    r = requests.get(
+        YAHOO_CHART_URL.format(symbol=symbol),
+        params={"interval": "1d", "range": "5d"},
+        headers=HEADERS, timeout=10,
+    )
+    r.raise_for_status()
+    meta  = r.json()["chart"]["result"][0]["meta"]
+    price = float(meta.get("regularMarketPrice") or 0)
+    prev  = float(meta.get("chartPreviousClose") or meta.get("previousClose") or price)
+    chg   = price - prev
+    pct   = (chg / prev * 100) if prev else 0.0
+    return round(price, 4), round(chg, 4), round(pct, 3)
+
+
+def _fetch_home_data():
+    indices, sectors = [], []
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        idx_futs = {pool.submit(_fetch_quote, sym): (sym, name) for sym, name in LAUNCHPAD_INDICES}
+        sec_futs = {pool.submit(_fetch_quote, sym): (sym, name) for sym, name in SECTORS}
+        for fut, (sym, name) in idx_futs.items():
+            try:
+                price, chg, pct = fut.result()
+                indices.append({"symbol": sym, "name": name,
+                                 "price": price, "chg": chg, "pct": pct})
+            except Exception:
+                indices.append({"symbol": sym, "name": name, "price": 0, "chg": 0, "pct": 0})
+        for fut, (sym, name) in sec_futs.items():
+            try:
+                price, chg, pct = fut.result()
+                sectors.append({"symbol": sym, "name": name,
+                                 "price": price, "chg": chg, "pct": pct})
+            except Exception:
+                sectors.append({"symbol": sym, "name": name, "price": 0, "chg": 0, "pct": 0})
+    # Preserve defined order
+    idx_order = {sym: i for i, (sym, _) in enumerate(LAUNCHPAD_INDICES)}
+    sec_order = {sym: i for i, (sym, _) in enumerate(SECTORS)}
+    indices.sort(key=lambda x: idx_order.get(x["symbol"], 99))
+    sectors.sort(key=lambda x: sec_order.get(x["symbol"], 99))
+    # Top signals from screener
+    all_stocks  = list(_state["stocks"].values())
+    top_signals = sorted(
+        [s for s in all_stocks if s["signal"] in ("BUY", "WATCH")],
+        key=lambda x: x["total"], reverse=True,
+    )[:12]
+    return {"indices": indices, "sectors": sectors, "signals": top_signals}
+
+
+def _get_home(force=False):
+    now = time.time()
+    if force or now - _home_cache["fetched"] > HOME_TTL or not _home_cache["data"]:
+        try:
+            _home_cache["data"]   = _fetch_home_data()
+            _home_cache["fetched"] = now
+        except Exception:
+            pass
+    return _home_cache["data"]
+
+
+def _fetch_news():
+    r = requests.get(NEWS_RSS_URL, headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    news = []
+    for item in re.findall(r"<item>(.*?)</item>", r.text, re.DOTALL)[:25]:
+        title_m = re.search(r"<title>(.*?)</title>", item)
+        link_m  = re.search(r"<link>(.*?)</link>",   item)
+        date_m  = re.search(r"<pubDate>(.*?)</pubDate>", item)
+        if not title_m:
+            continue
+        title = title_m.group(1)
+        title = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", title)
+        title = title.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        raw   = (date_m.group(1) if date_m else "").strip()
+        try:
+            ts = datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").strftime("%H:%M")
+        except Exception:
+            ts = raw[:5]
+        news.append({"title": title[:110], "link": link_m.group(1) if link_m else "#", "time": ts})
+    return news
+
+
+def _get_news(force=False):
+    now = time.time()
+    if force or now - _news_cache["fetched"] > NEWS_TTL or not _news_cache["data"]:
+        try:
+            _news_cache["data"]    = _fetch_news()
+            _news_cache["fetched"] = now
+        except Exception:
+            pass
+    return _news_cache["data"]
+
+
 # ── FastAPI ──────────────────────────────────────────────────────────────────────
 app = FastAPI()
 
@@ -753,6 +879,312 @@ async def legis_page():
     return LEGIS_HTML
 
 
+@app.get("/api/home")
+async def api_home():
+    return _json(_get_home())
+
+
+@app.get("/api/news")
+async def api_news():
+    return _json({"items": _get_news()})
+
+
+@app.get("/screener", response_class=HTMLResponse)
+async def screener_page():
+    return HTML_PAGE
+
+
+# ── Launchpad page ───────────────────────────────────────────────────────────────
+LAUNCHPAD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bloomberg Intelligence Terminal</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root{
+  --bg:#02020c;--bg2:#040614;--bg3:#060818;
+  --hdr:#000212;--amber:#ffa000;--abright:#ffd23c;--adim:#825200;
+  --white:#e1e1ee;--muted:#4e536c;--green:#00e15f;--red:#ff3737;
+  --cyan:#37c3ff;--border:#162a50;--panel:#030510;
+  --btn:#0a193c;--btnhov:#142d64;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{background:var(--bg);color:var(--white);
+  font-family:Consolas,'Lucida Console','Courier New',monospace;
+  font-size:12px;display:flex;flex-direction:column;padding:8px 10px}
+.nav{display:flex;gap:0;margin-bottom:5px;border-bottom:1px solid var(--border);flex-shrink:0}
+.nav a{color:var(--muted);text-decoration:none;padding:4px 14px;font-size:12px;
+  letter-spacing:.6px;border-bottom:2px solid transparent;margin-bottom:-1px}
+.nav a:hover{color:var(--amber)}
+.nav a.active{color:var(--abright);border-bottom-color:var(--abright)}
+.top-bar{display:flex;align-items:baseline;gap:16px;margin-bottom:5px;flex-shrink:0}
+.brand{color:var(--abright);font-size:17px;font-weight:bold;letter-spacing:1px}
+.tagline{color:var(--adim);font-size:11px}
+.clock{margin-left:auto;color:var(--muted);font-size:12px}
+.grid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;
+  gap:8px;flex:1;min-height:0}
+.panel{background:var(--panel);border:1px solid var(--border);
+  display:flex;flex-direction:column;overflow:hidden}
+.panel-hdr{background:var(--hdr);padding:5px 10px;font-size:11px;letter-spacing:.8px;
+  color:var(--adim);border-bottom:1px solid var(--border);flex-shrink:0;
+  display:flex;align-items:center;gap:8px}
+.panel-hdr .dot{color:var(--abright);font-size:14px}
+.panel-hdr .sub{margin-left:auto;color:var(--muted);font-size:10px}
+.panel-body{flex:1;overflow:auto;padding:0}
+/* Market Monitor */
+.idx-table{width:100%;border-collapse:collapse}
+.idx-table td{padding:4px 10px;border-bottom:1px solid #0a1428;white-space:nowrap}
+.idx-table tr:hover td{background:#071230}
+.idx-name{color:var(--muted);width:110px;font-size:11px;letter-spacing:.3px}
+.idx-price{color:var(--white);text-align:right;width:90px;font-size:12px}
+.idx-chg{text-align:right;width:80px;font-size:11px}
+.idx-pct{text-align:right;width:70px;font-size:12px;font-weight:bold}
+.pos{color:var(--green)}.neg{color:var(--red)}.flat{color:var(--muted)}
+/* Sector chart */
+.chart-wrap{flex:1;padding:8px;display:flex;align-items:center;justify-content:center;min-height:0}
+canvas{max-height:100%;max-width:100%}
+/* Top Signals */
+.sig-table{width:100%;border-collapse:collapse}
+.sig-table td{padding:4px 8px;border-bottom:1px solid #0a1428;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sig-table tr:hover td{background:#071230}
+.sig-ticker{color:var(--abright);width:54px;font-weight:bold}
+.sig-name{color:var(--white);max-width:140px;overflow:hidden;text-overflow:ellipsis}
+.sig-score{text-align:right;color:var(--cyan);width:38px}
+.sig-rsi{text-align:right;color:var(--muted);width:40px;font-size:11px}
+.sig-buy{color:var(--green);font-size:11px;text-align:center;width:50px;font-weight:bold}
+.sig-watch{color:var(--amber);font-size:11px;text-align:center;width:50px}
+/* News */
+.news-list{padding:2px 0}
+.news-item{padding:5px 10px;border-bottom:1px solid #0a1428;cursor:pointer}
+.news-item:hover{background:#071230}
+.news-time{color:var(--adim);font-size:10px;margin-bottom:2px}
+.news-title{color:var(--white);font-size:11px;line-height:1.4;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.news-item a{color:inherit;text-decoration:none}
+.news-item a:hover .news-title{color:var(--abright)}
+/* Loading */
+.loading{color:var(--adim);padding:20px 10px;font-size:11px}
+</style>
+</head>
+<body>
+<div class="nav">
+  <a href="/" class="active">LAUNCHPAD</a>
+  <a href="/screener">SCREENER</a>
+  <a href="/portfolios">PORTFOLIOS</a>
+  <a href="/legis">LEGIS</a>
+</div>
+<div class="top-bar">
+  <span class="brand">&#9672; BLOOMBERG INTELLIGENCE TERMINAL</span>
+  <span class="tagline">MARKET LAUNCHPAD</span>
+  <span class="clock" id="clock"></span>
+</div>
+
+<div class="grid">
+
+  <!-- Panel 1: Market Monitor -->
+  <div class="panel">
+    <div class="panel-hdr">
+      <span class="dot">&#9672;</span> MARKET MONITOR
+      <span class="sub" id="mkt-updated"></span>
+    </div>
+    <div class="panel-body" id="mkt-body">
+      <div class="loading">&nbsp; Loading market data...</div>
+    </div>
+  </div>
+
+  <!-- Panel 2: Sector Performance -->
+  <div class="panel">
+    <div class="panel-hdr">
+      <span class="dot">&#9672;</span> SECTOR PERFORMANCE &mdash; TODAY
+      <span class="sub" id="sec-updated"></span>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="sector-chart"></canvas>
+    </div>
+  </div>
+
+  <!-- Panel 3: Top Signals -->
+  <div class="panel">
+    <div class="panel-hdr">
+      <span class="dot">&#9672;</span> TOP SIGNALS
+      <span class="sub">FROM SCREENER</span>
+    </div>
+    <div class="panel-body" id="sig-body">
+      <div class="loading">&nbsp; Waiting for screener data...</div>
+    </div>
+  </div>
+
+  <!-- Panel 4: Market News -->
+  <div class="panel">
+    <div class="panel-hdr">
+      <span class="dot">&#9672;</span> MARKET NEWS
+      <span class="sub" id="news-updated"></span>
+    </div>
+    <div class="panel-body" id="news-body">
+      <div class="loading">&nbsp; Loading news feed...</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let sectorChart = null;
+
+function tick(){document.getElementById('clock').textContent=new Date().toTimeString().slice(0,8);}
+setInterval(tick,1000); tick();
+
+function pctCls(v){return v>0?'pos':v<0?'neg':'flat';}
+function sign(v){return v>0?'+':'';}
+function fmtPrice(v,sym){
+  if(sym==='BTC-USD'||sym==='^GSPC'||v>10000) return v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  if(v<1) return v.toFixed(4);
+  return v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+}
+
+async function loadHome(){
+  try{
+    const r=await fetch('/api/home');
+    const d=await r.json();
+    renderMarket(d.indices||[]);
+    renderSectors(d.sectors||[]);
+    renderSignals(d.signals||[]);
+    document.getElementById('mkt-updated').textContent='Updated '+new Date().toTimeString().slice(0,8);
+    document.getElementById('sec-updated').textContent='Updated '+new Date().toTimeString().slice(0,8);
+  }catch(e){console.error(e);}
+}
+
+async function loadNews(){
+  try{
+    const r=await fetch('/api/news');
+    const d=await r.json();
+    renderNews(d.items||[]);
+    document.getElementById('news-updated').textContent='Updated '+new Date().toTimeString().slice(0,8);
+  }catch(e){}
+}
+
+function renderMarket(rows){
+  if(!rows.length){document.getElementById('mkt-body').innerHTML='<div class="loading">&nbsp; No data.</div>';return;}
+  document.getElementById('mkt-body').innerHTML=`
+    <table class="idx-table">
+      ${rows.map(r=>`<tr>
+        <td class="idx-name">&nbsp;${r.name}</td>
+        <td class="idx-price">${fmtPrice(r.price,r.symbol)}</td>
+        <td class="idx-chg ${pctCls(r.chg)}">${sign(r.chg)}${r.chg.toFixed(2)}</td>
+        <td class="idx-pct ${pctCls(r.pct)}">${sign(r.pct)}${r.pct.toFixed(2)}%</td>
+      </tr>`).join('')}
+    </table>`;
+}
+
+function renderSectors(sectors){
+  if(!sectors.length) return;
+  const labels = sectors.map(s=>s.name);
+  const pcts   = sectors.map(s=>s.pct);
+  const colors = pcts.map(p=>{
+    if(p>=0){
+      const g=Math.min(255,80+p*40);
+      return `rgba(0,${g},70,0.88)`;
+    } else {
+      const r=Math.min(255,140+Math.abs(p)*30);
+      return `rgba(${r},40,40,0.88)`;
+    }
+  });
+
+  if(sectorChart) sectorChart.destroy();
+  const ctx=document.getElementById('sector-chart').getContext('2d');
+  sectorChart=new Chart(ctx,{
+    type:'polarArea',
+    data:{
+      labels,
+      datasets:[{
+        data: pcts.map(p=>Math.max(Math.abs(p),0.3)),
+        backgroundColor: colors,
+        borderColor:'#0d1830',
+        borderWidth:1,
+      }]
+    },
+    options:{
+      responsive:true,
+      plugins:{
+        legend:{
+          position:'right',
+          labels:{
+            color:'#a0a8c0',
+            font:{family:"Consolas,'Courier New',monospace",size:10},
+            boxWidth:10,padding:6,
+            generateLabels(chart){
+              return chart.data.labels.map((label,i)=>{
+                const pct=pcts[i];
+                return{text:`${label}  ${pct>=0?'+':''}${pct.toFixed(2)}%`,
+                  fillStyle:colors[i],strokeStyle:'#0d1830',lineWidth:1,hidden:false,index:i};
+              });
+            }
+          }
+        },
+        tooltip:{
+          callbacks:{label:(ctx)=>{
+            const p=pcts[ctx.dataIndex];
+            return ` ${ctx.label}: ${p>=0?'+':''}${p.toFixed(2)}%`;
+          }}
+        }
+      },
+      scales:{r:{
+        ticks:{display:false},
+        grid:{color:'#0d1830'},
+        angleLines:{color:'#0d1830'},
+      }}
+    }
+  });
+}
+
+function renderSignals(sigs){
+  if(!sigs.length){document.getElementById('sig-body').innerHTML='<div class="loading">&nbsp; Waiting for screener...</div>';return;}
+  document.getElementById('sig-body').innerHTML=`
+    <table class="sig-table">
+      <thead><tr style="background:#000212">
+        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:10px">TICKER</th>
+        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:10px">COMPANY</th>
+        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:10px;text-align:right">SCORE</th>
+        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:10px;text-align:right">RSI</th>
+        <th style="padding:4px 8px;color:#4e536c;font-weight:normal;font-size:10px;text-align:center">SIG</th>
+      </tr></thead>
+      <tbody>
+      ${sigs.map(s=>`<tr onclick="window.open('/chart/${s.symbol}','_blank')" style="cursor:pointer">
+        <td class="sig-ticker">&nbsp;${s.symbol}</td>
+        <td class="sig-name">&nbsp;${(s.name||'').slice(0,22)}</td>
+        <td class="sig-score">${s.total}</td>
+        <td class="sig-rsi">${s.rsi}</td>
+        <td class="${s.signal==='BUY'?'sig-buy':'sig-watch'}">${s.signal}</td>
+      </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+function renderNews(items){
+  if(!items.length){document.getElementById('news-body').innerHTML='<div class="loading">&nbsp; No news available.</div>';return;}
+  document.getElementById('news-body').innerHTML=`<div class="news-list">
+    ${items.map(n=>`<div class="news-item">
+      <a href="${n.link}" target="_blank">
+        <div class="news-time">&nbsp;${n.time}</div>
+        <div class="news-title">&nbsp;${n.title}</div>
+      </a>
+    </div>`).join('')}
+  </div>`;
+}
+
+// Initial load
+loadHome();
+loadNews();
+// Refresh every 5 minutes
+setInterval(loadHome, 300000);
+setInterval(loadNews, 300000);
+</script>
+</body>
+</html>"""
+
+
 # ── HTML page ────────────────────────────────────────────────────────────────────
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -857,7 +1289,7 @@ tbody tr:hover{background:#0d1535}
 <body>
 
 <div class="hdr">
-  <div class="nav"><a href="/" class="active">SCREENER</a><a href="/portfolios">PORTFOLIOS</a><a href="/legis">LEGIS</a></div>
+  <div class="nav"><a href="/">LAUNCHPAD</a><a href="/screener" class="active">SCREENER</a><a href="/portfolios">PORTFOLIOS</a><a href="/legis">LEGIS</a></div>
   <span class="title">&#9672; MOWAD INTELLIGENCE TERMINAL</span>
   <span class="subtitle">MULTI-FACTOR STOCK SCORING ENGINE</span>
   <span class="clock" id="clock"></span>
@@ -1356,7 +1788,8 @@ a.bill-link:hover{text-decoration:underline}
 </head>
 <body>
 <div class="nav">
-  <a href="/">SCREENER</a>
+  <a href="/">LAUNCHPAD</a>
+  <a href="/screener">SCREENER</a>
   <a href="/portfolios">PORTFOLIOS</a>
   <a href="/legis" class="active">LEGIS</a>
 </div>
@@ -1570,7 +2003,8 @@ tbody tr:hover{background:#0d1535}
 </head>
 <body>
 <div class="nav">
-  <a href="/">SCREENER</a>
+  <a href="/">LAUNCHPAD</a>
+  <a href="/screener">SCREENER</a>
   <a href="/portfolios" class="active">PORTFOLIOS</a>
   <a href="/legis">LEGIS</a>
 </div>
@@ -1727,7 +2161,7 @@ fetchAndRender();
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return HTML_PAGE
+    return LAUNCHPAD_HTML
 
 
 if __name__ == "__main__":
