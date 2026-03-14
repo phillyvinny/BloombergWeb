@@ -352,8 +352,8 @@ _AMOUNT_RANK = {
     "$1,000,001 - $5,000,000": 7, "over $5,000,000": 8,
 }
 
-_congress_cache = {"data": [], "fetched": 0.0}
-CONGRESS_TTL    = 86400  # re-fetch once per day (PDFs don't change)
+_congress_cache  = {"data": [], "fetched": 0.0, "loading": False}
+CONGRESS_TTL     = 86400  # re-fetch once per day (PDFs don't change)
 
 _HDR_PAT   = re.compile(r"^(ID Owner|Cap\.|Gains|Notification|\$200|Amount Cap)")
 _OWNER_PAT = re.compile(r"^(?:SP|JT|DC|SE|DEP|OC|OP)\s+")
@@ -466,12 +466,24 @@ def _fetch_congress_trades():
     return rows
 
 
+def _bg_congress():
+    """Background worker: fetch all congress trades and populate cache."""
+    if _congress_cache["loading"]:
+        return
+    _congress_cache["loading"] = True
+    try:
+        _congress_cache["data"]    = _fetch_congress_trades()
+        _congress_cache["fetched"] = time.time()
+    finally:
+        _congress_cache["loading"] = False
+
+
 def _get_congress(force=False):
     now = time.time()
-    if force or now - _congress_cache["fetched"] > CONGRESS_TTL or not _congress_cache["data"]:
-        _congress_cache["data"]    = _fetch_congress_trades()
-        _congress_cache["fetched"] = now
-    return _congress_cache["data"]
+    stale = force or now - _congress_cache["fetched"] > CONGRESS_TTL or not _congress_cache["data"]
+    if stale and not _congress_cache["loading"]:
+        threading.Thread(target=_bg_congress, daemon=True).start()
+    return _congress_cache["data"]  # return whatever is cached right now
 
 
 # ── JSON helper ──────────────────────────────────────────────────────────────────
@@ -585,7 +597,7 @@ async def api_portfolios(
     elif sort == "name":   rows = sorted(rows, key=lambda r: r["name"],             reverse=rev)
     elif sort == "ticker": rows = sorted(rows, key=lambda r: r["ticker"],           reverse=rev)
     else:                  rows = sorted(rows, key=lambda r: r["transaction_date"], reverse=rev)
-    return _json({"trades": rows[:1000], "total": len(rows)})
+    return _json({"trades": rows[:1000], "total": len(rows), "loading": _congress_cache["loading"]})
 
 
 @app.post("/api/portfolios/refresh")
@@ -1302,18 +1314,32 @@ function typeCls(t){
   return 'exch';
 }
 
+let pollTimer=null;
+
 async function fetchAndRender(){
   const p=new URLSearchParams({chamber:S.chamber,ttype:S.ttype,sort:S.sortKey,dir:S.sortDir,q:S.search});
   const r=await fetch('/api/portfolios?'+p);
   const d=await r.json();
-  renderTable(d.trades, d.total);
+  renderTable(d.trades, d.total, d.loading);
+  // If still loading, poll every 5 seconds
+  clearTimeout(pollTimer);
+  if(d.loading) pollTimer=setTimeout(fetchAndRender, 5000);
 }
 
-function renderTable(rows, total){
-  document.getElementById('lbl-count').textContent=`  Showing ${rows.length} of ${total} disclosures`;
+function renderTable(rows, total, loading){
+  const countEl=document.getElementById('lbl-count');
+  const statusEl=document.getElementById('lbl-status');
+  if(loading){
+    statusEl.textContent='  LOADING DISCLOSURES...';
+    statusEl.style.color='var(--amber)';
+  } else {
+    statusEl.textContent='  READY';
+    statusEl.style.color='var(--green)';
+  }
+  countEl.textContent=`  Showing ${rows.length} of ${total} disclosures`;
   const tbody=document.getElementById('tbody');
   if(!rows.length){
-    tbody.innerHTML='<tr><td colspan="8" style="color:var(--muted);padding:20px">  No records match the current filters.</td></tr>';
+    tbody.innerHTML=`<tr><td colspan="8" style="color:var(--muted);padding:20px">${loading?'  Downloading House STOCK Act disclosures from official records... please wait.':'  No records match the current filters.'}</td></tr>`;
     return;
   }
   tbody.innerHTML=rows.map((r,i)=>`<tr>
@@ -1351,5 +1377,6 @@ async def index():
 
 if __name__ == "__main__":
     trigger_refresh()
+    threading.Thread(target=_bg_congress, daemon=True).start()
     uvicorn.run(app, host="127.0.0.1", port=8888, log_level="warning")
 ###Stop-Process -Id (Get-NetTCPConnection -LocalPort 8888).OwningProcess -Force
