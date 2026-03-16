@@ -39,20 +39,30 @@ from pypdf import PdfReader
 # ── Config ──────────────────────────────────────────────────────────────────────
 POLYGON_BASE    = "https://api.polygon.io"
 POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "OehRygcqWPd78jOSWTBgfhu9oCsBqxcw")
+YAHOO_CHART_URL  = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+YAHOO_QUOTE_URL  = "https://query1.finance.yahoo.com/v7/finance/quote"
 
 LAUNCHPAD_INDICES = [
     # symbol=None → section header row (no fetch)
-    # All symbols are US equity ETFs — last close shown when market is closed
-    (None,   "── INDICES ──"),
-    ("DIA",  "DOW JONES"),
-    ("SPY",  "S&P 500"),
-    ("QQQ",  "NASDAQ"),
-    ("IWM",  "RUSSELL 2K"),
-    ("VIXY", "VIX"),
-    ("TLT",  "10Y YIELD"),
-    (None,   "── CRYPTO ──"),
-    ("X:BTCUSD", "BITCOIN"),
-    ("X:ETHUSD", "ETHEREUM"),
+    # Uses Yahoo Finance symbols: ^ prefix for indices, -USD suffix for crypto, =F suffix for futures
+    (None,      "── INDICES ──"),
+    ("^DJI",    "DOW JONES"),
+    ("^GSPC",   "S&P 500"),
+    ("^IXIC",   "NASDAQ"),
+    ("^RUT",    "RUSSELL 2K"),
+    ("^VIX",    "VIX"),
+    ("^TNX",    "10Y YIELD"),
+    (None,      "── COMMODITIES ──"),
+    ("GC=F",    "GOLD"),
+    ("SI=F",    "SILVER"),
+    ("PL=F",    "PLATINUM"),
+    ("CL=F",    "WTI CRUDE"),
+    ("BZ=F",    "BRENT CRUDE"),
+    ("NG=F",    "NAT GAS"),
+    ("HG=F",    "COPPER"),
+    (None,      "── CRYPTO ──"),
+    ("BTC-USD", "BITCOIN"),
+    ("ETH-USD", "ETHEREUM"),
 ]
 
 SECTORS = [
@@ -75,8 +85,20 @@ HEADERS          = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
+
+# Thread-local HTTP session — reuses TCP+TLS connections within each worker thread
+_tls = threading.local()
+
+def _session():
+    if not hasattr(_tls, "s"):
+        from requests.adapters import HTTPAdapter
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        s.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=8))
+        _tls.s = s
+    return _tls.s
 REFRESH_INTERVAL  = 1800           # 30 min — full screener refresh
-MAX_WORKERS       = 20
+MAX_WORKERS       = 60             # Yahoo Finance has no hard rate limit; 60 concurrent = ~10s for 591 stocks
 SCORE_BUY         = 65
 SCORE_WATCH       = 40
 SCREENER_CACHE    = Path(__file__).parent / "screener_cache.json"
@@ -102,38 +124,75 @@ NASDAQ_100 = [
     "AZN",   "APP",   "CDW",   "NTAP",  "ZM",    "SMCI",  "MSTR",  "PSTG",  "ZBRA",  "ALGN",
 ]
 
-SP500_EXTRA = [
-    "BRK-B", "JPM",  "BAC",  "WFC",  "MS",   "GS",   "C",    "BX",   "KKR",  "BLK",
-    "SPGI",  "MCO",  "ICE",  "FI",   "COF",  "AXP",  "DFS",  "USB",  "PNC",  "TFC",
-    "MTB",   "FITB", "KEY",  "RF",   "HBAN", "CFG",  "ALLY", "SYF",  "AIG",  "MET",
-    "PRU",   "AFL",  "ALL",  "PGR",  "CB",   "TRV",  "AON",  "MMC",  "WTW",  "RE",
-    "LLY",   "ABBV", "ABT",  "MDT",  "SYK",  "BSX",  "ELV",  "CI",   "HUM",  "CVS",
-    "HCA",   "CNC",  "MOH",  "DHR",  "EW",   "RMD",  "ZBH",  "BDX",  "BAX",  "COO",
-    "MTD",   "TFX",  "HOLX", "PODD", "VTRS", "JAZZ", "NBIX", "INCY", "ALNY", "BMRN",
-    "XOM",   "CVX",  "COP",  "EOG",  "PSX",  "VLO",  "MPC",  "OXY",  "DVN",  "HAL",
-    "SLB",   "BKR",  "HES",  "CTRA", "APA",  "MRO",  "NOV",  "FTI",  "WMB",  "OKE",
-    "KMI",   "ET",   "EPD",  "LNG",  "TRGP",
-    "RTX",   "GE",   "LMT",  "NOC",  "GD",   "L3H",  "TXT",  "HII",  "TDG",  "AXON",
-    "UNP",   "FDX",  "UPS",  "DAL",  "UAL",  "LUV",  "AAL",  "JBLU", "WM",   "RSG",
-    "ETN",   "EMR",  "NSC",  "GWW",  "ROK",  "PH",   "ITW",  "DOV",  "AME",  "XYL",
-    "IEX",   "GNRC", "TT",   "CARR", "OTIS", "JCI",  "PWR",  "MTZ",  "FBIN", "MAS",
-    "CMG",   "YUM",  "DPZ",  "DG",   "KR",   "SYY",  "RL",   "PVH",  "TPR",  "VFC",
-    "HLT",   "H",    "WH",   "MGM",  "LVS",  "WYNN", "CZR",  "PENN", "DKNG", "BALY",
-    "F",     "GM",   "STLA", "TM",   "HMC",  "AN",   "LAD",  "PAG",  "KMX",  "AZO",
-    "ORLY",  "AAP",  "GPC",  "MNRO",
-    "MO",    "PM",   "BTI",  "STZ",  "BUD",  "TAP",  "K",    "GIS",  "CPB",  "CAG",
-    "SJM",   "MKC",  "HRL",  "TSN",  "PPC",  "SAFM", "WBA",  "RAD",  "CL",   "CHD",
-    "CLX",   "PG",   "KMB",  "EL",   "COTY",
-    "ORCL",  "ACN",  "HPQ",  "HPE",  "DELL", "WDC",  "STX",  "KEYS", "TDC",  "LDOS",
-    "SAIC",  "CSRA", "DXC",  "EPAM", "CTSH", "WIT",  "INFY", "TCS",
-    "LIN",   "APD",  "DD",   "NEM",  "FCX",  "NUE",  "STLD", "CLF",  "ALB",  "PPG",
-    "EMN",   "CE",   "OLN",  "WLK",  "LYB",  "MOS",  "CF",   "FMC",  "IFF",  "SON",
-    "PLD",   "AMT",  "EQIX", "SPG",  "O",    "VICI", "PSA",  "EXR",  "AVB",  "EQR",
-    "ARE",   "WY",   "CBRE", "JLL",  "CCI",  "SBA",  "SBAC", "IRM",  "DLR",  "QTS",
-    "NEE",   "DUK",  "SO",   "D",    "AEP",  "SRE",  "PCG",  "ED",   "ES",   "FE",
-    "WEC",   "ETR",  "PPL",  "AEE",  "CNP",  "NI",   "CMS",  "PNW",  "EVRG", "AWK",
-    "T",     "VZ",   "CMCSA","DIS",  "NFLX", "PARA", "FOX",  "NWS",  "NYT",  "IAC",
-    "ZG",    "MTCH", "BMBL", "SNAP", "PINS",
+SP500 = [
+    # ── Financials ───────────────────────────────────────────────────────────────
+    "BRK-B","JPM",  "V",    "MA",   "BAC",  "WFC",  "MS",   "GS",   "C",    "BX",
+    "KKR",  "BLK",  "SPGI", "MCO",  "ICE",  "FI",   "COF",  "AXP",  "DFS",  "USB",
+    "PNC",  "TFC",  "MTB",  "FITB", "KEY",  "RF",   "HBAN", "CFG",  "ALLY", "SYF",
+    "AIG",  "MET",  "PRU",  "AFL",  "ALL",  "PGR",  "CB",   "TRV",  "AON",  "MMC",
+    "WTW",  "RE",   "SCHW", "RJF",  "IBKR", "LNC",  "UNM",  "FNF",  "FAF",  "HIG",
+    "EG",   "RGA",  "GL",   "CINF", "VOYA", "CMA",  "ZION", "WAL",  "FHN",  "CME",
+    "CBOE", "NDAQ", "MKTX", "LPLA", "SF",   "STT",  "BK",   "NTRS", "TROW", "IVZ",
+    "WBS",  "GBCI", "PACW", "EWBC", "HOPE",
+    # ── Healthcare ───────────────────────────────────────────────────────────────
+    "UNH",  "LLY",  "JNJ",  "ABBV", "MRK",  "TMO",  "ABT",  "DHR",  "BMY",  "AMGN",
+    "GILD", "ISRG", "REGN", "BSX",  "MDT",  "SYK",  "ZTS",  "ELV",  "CI",   "HUM",
+    "CVS",  "HCA",  "CNC",  "MOH",  "EW",   "RMD",  "ZBH",  "BDX",  "BAX",  "COO",
+    "MTD",  "TFX",  "HOLX", "PODD", "VTRS", "JAZZ", "NBIX", "INCY", "ALNY", "BMRN",
+    "PFE",  "IQV",  "LH",   "DGX",  "CRL",  "UHS",  "STE",  "TECH", "PKI",  "MCK",
+    "ABC",  "CAH",  "UTHR", "EXAS", "NTRA", "MRNA", "BNTX", "HLN",  "RCM",  "RVTY",
+    "CRVL", "OMCL", "MMSI", "NVCR", "ACAD", "HALO", "LGND", "PRGO", "PAHC", "PDCO",
+    # ── Information Technology ───────────────────────────────────────────────────
+    "AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CSCO", "ACN",  "IBM",  "CRM",  "NOW",
+    "INTU", "AMD",  "ADBE", "QCOM", "AMAT", "MU",   "KLAC", "LRCX", "SNPS", "CDNS",
+    "ADI",  "MRVL", "KEYS", "HPQ",  "HPE",  "DELL", "WDC",  "STX",  "NTAP", "ZBRA",
+    "PTC",  "ANSS", "TDY",  "TRMB", "GEN",  "GDDY", "CDW",  "JNPR", "IT",   "EPAM",
+    "LDOS", "SAIC", "TYL",  "PAYC", "PCTY", "FFIV", "BR",   "GLW",  "ENPH", "FSLR",
+    "TDC",  "DXC",  "CTSH", "INFY", "CAPL", "ACM",  "CACI", "SAIC", "PEGA", "MANH",
+    # ── Consumer Discretionary ───────────────────────────────────────────────────
+    "AMZN", "TSLA", "HD",   "MCD",  "NKE",  "LOW",  "TJX",  "BKNG", "ABNB", "CMG",
+    "YUM",  "DPZ",  "DG",   "DLTR", "TGT",  "ROST", "BBY",  "ETSY", "RH",   "ULTA",
+    "SIG",  "FIVE", "GPS",  "PVH",  "RL",   "TPR",  "VFC",  "HBI",  "BBWI", "SKX",
+    "HLT",  "H",    "WH",   "MAR",  "MGM",  "LVS",  "WYNN", "CZR",  "DKNG", "F",
+    "GM",   "AN",   "LAD",  "PAG",  "KMX",  "AZO",  "ORLY", "AAP",  "GPC",  "NCLH",
+    "CCL",  "RCL",  "HAS",  "MAT",  "LEVI", "OXM",  "GRMN", "POOL", "SNA",  "KR",
+    "SYY",  "DRI",  "EAT",  "TXRH", "JACK", "SHAK", "WING",
+    # ── Consumer Staples ─────────────────────────────────────────────────────────
+    "WMT",  "COST", "PG",   "KO",   "PEP",  "MO",   "PM",   "STZ",  "TAP",  "K",
+    "GIS",  "CPB",  "CAG",  "SJM",  "MKC",  "HRL",  "TSN",  "WBA",  "CL",   "CHD",
+    "CLX",  "KMB",  "EL",   "HSY",  "KHC",  "MDLZ", "MNST", "BF-B", "SAM",  "UTZ",
+    "LANC", "THS",  "SMPL", "COTY", "REV",  "CENT",
+    # ── Energy ───────────────────────────────────────────────────────────────────
+    "XOM",  "CVX",  "COP",  "EOG",  "PSX",  "VLO",  "MPC",  "OXY",  "DVN",  "HAL",
+    "SLB",  "BKR",  "HES",  "CTRA", "APA",  "MRO",  "WMB",  "OKE",  "KMI",  "LNG",
+    "TRGP", "NOV",  "FANG", "PR",   "MTDR", "SM",   "CHRD", "RRC",  "EQT",  "CNX",
+    "AR",   "SWN",  "PXD",  "FTI",  "CHK",
+    # ── Industrials ──────────────────────────────────────────────────────────────
+    "RTX",  "GE",   "LMT",  "NOC",  "GD",   "TXT",  "HII",  "TDG",  "AXON", "UNP",
+    "FDX",  "UPS",  "DAL",  "UAL",  "LUV",  "AAL",  "WM",   "RSG",  "ETN",  "EMR",
+    "NSC",  "GWW",  "ROK",  "PH",   "ITW",  "DOV",  "AME",  "XYL",  "IEX",  "GNRC",
+    "TT",   "CARR", "OTIS", "JCI",  "PWR",  "MTZ",  "MAS",  "FAST", "CTAS", "ADP",
+    "VRSK", "CPRT", "EXPD", "CHRW", "XPO",  "JBHT", "LSTR", "SAIA", "HUBG", "R",
+    "URI",  "AGCO", "CAT",  "DE",   "PCAR", "WAB",  "TRU",  "MHK",  "FLS",  "ACCO",
+    "AOS",  "LII",  "ALLE", "IR",   "NDSN", "GXO",  "HURN", "KFRC",
+    # ── Materials ────────────────────────────────────────────────────────────────
+    "LIN",  "APD",  "ECL",  "SHW",  "DD",   "NEM",  "FCX",  "NUE",  "STLD", "CLF",
+    "ALB",  "PPG",  "EMN",  "CE",   "OLN",  "WLK",  "LYB",  "MOS",  "CF",   "FMC",
+    "IFF",  "VMC",  "MLM",  "AMCR", "PKG",  "IP",   "SEE",  "AVY",  "RPM",  "ATI",
+    "MP",   "RGLD", "WPM",  "AA",   "X",    "ZEUS",
+    # ── Real Estate ──────────────────────────────────────────────────────────────
+    "PLD",  "AMT",  "EQIX", "SPG",  "O",    "VICI", "PSA",  "EXR",  "AVB",  "EQR",
+    "ARE",  "WY",   "CBRE", "CCI",  "IRM",  "DLR",  "VTR",  "WELL", "INVH", "MAA",
+    "NNN",  "FR",   "EGP",  "REXR", "COLD", "STAG", "NSA",  "CUBE", "LSI",  "KIM",
+    "REG",  "FRT",  "BXP",  "SLG",  "HIW",  "CUZ",  "PDM",  "VNO",  "PGRE",
+    # ── Utilities ────────────────────────────────────────────────────────────────
+    "NEE",  "DUK",  "SO",   "D",    "AEP",  "SRE",  "PCG",  "ED",   "ES",   "FE",
+    "WEC",  "ETR",  "PPL",  "AEE",  "CNP",  "NI",   "CMS",  "PNW",  "EVRG", "AWK",
+    "EIX",  "XEL",  "AES",  "LNT",  "OTTR", "POR",  "AVA",  "NWE",  "IDACORP","BKH",
+    # ── Communication Services ───────────────────────────────────────────────────
+    "GOOGL","GOOG", "META", "NFLX", "DIS",  "CMCSA","T",    "VZ",   "TMUS", "ATVI",
+    "EA",   "TTWO", "MTCH", "SNAP", "PINS", "BMBL", "NYT",  "NWS",  "PARA", "FOX",
+    "WBD",  "LYV",  "SIRI", "IAC",  "ZG",   "RBLX", "SPOT", "ROKU",
 ]
 
 
@@ -145,7 +204,7 @@ def _build_universe():
     for sym in NASDAQ_100:
         if sym not in seen:
             seen.add(sym); result.append((sym, "NDAQ"))
-    for sym in SP500_EXTRA:
+    for sym in SP500:
         if sym not in seen:
             seen.add(sym); result.append((sym, "SP500"))
     return result
@@ -174,12 +233,38 @@ def _ema(data, period):
 
 
 def _rsi(closes, period=14):
-    if len(closes) < period + 1:
+    """Single RSI value using Wilder's smoothed moving average."""
+    n = len(closes)
+    if n < period + 1:
         return 50.0
-    d  = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    ag = sum(max(v, 0) for v in d[-period:]) / period
-    al = sum(max(-v, 0) for v in d[-period:]) / period
+    deltas = [closes[i] - closes[i - 1] for i in range(1, n)]
+    gains  = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    for i in range(period, len(deltas)):
+        ag = (ag * (period - 1) + gains[i]) / period
+        al = (al * (period - 1) + losses[i]) / period
     return 100.0 if al == 0 else 100.0 - (100.0 / (1.0 + ag / al))
+
+
+def _rsi_series(closes, period=14):
+    """Full RSI series using Wilder's smoothed moving average. Returns list same length as closes."""
+    n = len(closes)
+    if n < period + 1:
+        return [None] * n
+    deltas = [closes[i] - closes[i - 1] for i in range(1, n)]
+    gains  = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+    out = [None] * n
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    out[period] = 100.0 if al == 0 else 100.0 - (100.0 / (1.0 + ag / al))
+    for i in range(period, len(deltas)):
+        ag = (ag * (period - 1) + gains[i]) / period
+        al = (al * (period - 1) + losses[i]) / period
+        out[i + 1] = 100.0 if al == 0 else 100.0 - (100.0 / (1.0 + ag / al))
+    return out
 
 
 def _score(closes):
@@ -248,16 +333,15 @@ def _bar(score, mx=20):
 
 def _fetch_one(sym, idx):
     try:
-        today     = date.today()
-        from_date = str(today - timedelta(days=90))
-        to_date   = str(today)
-        data  = _poly_get(
-            f"{POLYGON_BASE}/v2/aggs/ticker/{sym}/range/1/day/{from_date}/{to_date}",
-            params={"adjusted": "true", "sort": "asc", "limit": 500},
-            timeout=20,
+        r = _session().get(
+            YAHOO_CHART_URL.format(symbol=sym),
+            params={"interval": "1d", "range": "3mo"},
+            timeout=7,
         )
-        bars   = data.get("results") or []
-        closes = [b["c"] for b in bars if b.get("c") is not None]
+        r.raise_for_status()
+        res    = r.json()["chart"]["result"][0]
+        meta   = res["meta"]
+        closes = [c for c in res["indicators"]["quote"][0].get("close", []) if c is not None]
         sc     = _score(closes)
         if sc is None:
             return None
@@ -265,10 +349,10 @@ def _fetch_one(sym, idx):
         analyst_mean = None
         total  = sc["total"]
         signal = "BUY" if total >= SCORE_BUY else ("WATCH" if total >= SCORE_WATCH else "NO BUY")
-        price  = closes[-1] if closes else 0.0
+        price  = float(meta.get("regularMarketPrice") or (closes[-1] if closes else 0))
         return {
             "symbol":       sym,
-            "name":         sym,
+            "name":         (meta.get("longName") or meta.get("shortName") or sym)[:32],
             "price":        round(price, 4),
             "index":        idx,
             "ema_s":        sc["ema_s"],
@@ -357,62 +441,84 @@ def _market_open():
     return open_t <= now <= close_t
 
 
+# ── Chart timeframe params ────────────────────────────────────────────────────────
+_TF_PARAMS = {
+    "1d":  ("1d",  "5m"),
+    "1w":  ("5d",  "60m"),
+    "1m":  ("1mo", "1d"),
+    "3m":  ("3mo", "1d"),
+    "6m":  ("6mo", "1d"),
+    "ytd": ("ytd", "1d"),
+    "1y":  ("1y",  "1d"),
+    "max": ("5y",  "1wk"),
+}
+
 # ── MACD Chart Data ──────────────────────────────────────────────────────────────
-def _compute_chart_data(sym):
-    """Fetch 6 months of OHLCV data and return full indicator series for charting."""
-    today     = date.today()
-    from_date = str(today - timedelta(days=180))
-    to_date   = str(today)
-    data = _poly_get(
-        f"{POLYGON_BASE}/v2/aggs/ticker/{sym}/range/1/day/{from_date}/{to_date}",
-        params={"adjusted": "true", "sort": "asc", "limit": 500},
-        timeout=20,
+def _compute_chart_data(sym, tf="1y"):
+    """Fetch OHLCV data for the given timeframe and return full indicator series."""
+    yrange, interval = _TF_PARAMS.get(tf, ("1y", "1d"))
+    intraday = interval not in ("1d", "1wk")
+
+    r = requests.get(
+        YAHOO_CHART_URL.format(symbol=sym),
+        params={"interval": interval, "range": yrange},
+        headers=HEADERS, timeout=20,
     )
-    bars = data.get("results") or []
+    r.raise_for_status()
+    result     = r.json()["chart"]["result"][0]
+    timestamps = result.get("timestamp", [])
+    quote      = result["indicators"]["quote"][0]
+    opens_raw  = quote.get("open",   [])
+    highs_raw  = quote.get("high",   [])
+    lows_raw   = quote.get("low",    [])
+    closes_raw = quote.get("close",  [])
+    vols_raw   = quote.get("volume", [])
 
     rows = []
-    for b in bars:
-        if any(b.get(k) is None for k in ["o", "h", "l", "c"]):
+    for t, o, h, l, c, v in zip(timestamps, opens_raw, highs_raw, lows_raw, closes_raw, vols_raw):
+        if any(x is None for x in [o, h, l, c]):
             continue
-        dt = datetime.utcfromtimestamp(b["t"] / 1000).strftime("%Y-%m-%d")
-        rows.append((dt, float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"]), int(b.get("v") or 0)))
+        time_val = int(t) if intraday else datetime.utcfromtimestamp(t).strftime("%Y-%m-%d")
+        rows.append((time_val, float(o), float(h), float(l), float(c), int(v or 0)))
 
-    if len(rows) < 35:
+    if len(rows) < 10:
         return None
 
-    dates  = [r[0] for r in rows]
+    times  = [r[0] for r in rows]
     closes = [r[4] for r in rows]
+    n      = len(closes)
 
-    ema20v = _ema(closes, 20)
-    ema50v = _ema(closes, min(50, len(closes)))
-    ema12  = _ema(closes, 12)
-    ema26  = _ema(closes, 26)
-    macd   = [a - b for a, b in zip(ema12, ema26)]
-    sig    = _ema(macd, 9)
-    hist   = [m - s for m, s in zip(macd, sig)]
+    ema9v   = _ema(closes, min(9,   n))
+    ema20v  = _ema(closes, min(20,  n))
+    ema200v = _ema(closes, min(200, n)) if not intraday else []
+    ema12   = _ema(closes, min(12,  n))
+    ema26   = _ema(closes, min(26,  n))
+    macd    = [a - b for a, b in zip(ema12, ema26)]
+    sig     = _ema(macd, min(9, len(macd)))
+    hist    = [m - s for m, s in zip(macd, sig)]
 
-    rsi_series = []
-    for i in range(len(closes)):
-        if i < 15:
-            continue
-        rsi_series.append({"time": dates[i], "value": round(_rsi(closes[:i+1]), 2)})
+    rsi_vals   = _rsi_series(closes)
+    rsi_series = [{"time": times[i], "value": round(rsi_vals[i], 2)}
+                  for i in range(n) if rsi_vals[i] is not None]
 
     return {
         "symbol":     sym,
         "name":       sym,
         "price":      round(closes[-1], 2),
-        "candles":    [{"time": d, "open": o, "high": h, "low": l, "close": c}
-                       for d, o, h, l, c, v in rows],
-        "volumes":    [{"time": d, "value": v,
+        "intraday":   intraday,
+        "candles":    [{"time": t, "open": o, "high": h, "low": l, "close": c}
+                       for t, o, h, l, c, v in rows],
+        "volumes":    [{"time": t, "value": v,
                         "color": "#00e15f55" if c >= o else "#ff373755"}
-                       for d, o, h, l, c, v in rows],
-        "ema20":      [{"time": d, "value": round(v, 2)} for d, v in zip(dates, ema20v)],
-        "ema50":      [{"time": d, "value": round(v, 2)} for d, v in zip(dates, ema50v)],
-        "macd":       [{"time": d, "value": round(v, 4)} for d, v in zip(dates, macd)],
-        "signal":     [{"time": d, "value": round(v, 4)} for d, v in zip(dates, sig)],
-        "hist":       [{"time": d, "value": round(v, 4),
+                       for t, o, h, l, c, v in rows],
+        "ema9":       [{"time": t, "value": round(v, 2)} for t, v in zip(times, ema9v)],
+        "ema20":      [{"time": t, "value": round(v, 2)} for t, v in zip(times, ema20v)],
+        "ema200":     [{"time": t, "value": round(v, 2)} for t, v in zip(times, ema200v)],
+        "macd":       [{"time": t, "value": round(v, 4)} for t, v in zip(times, macd)],
+        "signal":     [{"time": t, "value": round(v, 4)} for t, v in zip(times, sig)],
+        "hist":       [{"time": t, "value": round(v, 4),
                         "color": "#00e15f" if v >= 0 else "#ff3737"}
-                       for d, v in zip(dates, hist)],
+                       for t, v in zip(times, hist)],
         "rsi":        rsi_series,
         "macd_val":   round(macd[-1], 4),
         "signal_val": round(sig[-1], 4),
@@ -753,49 +859,243 @@ HOME_TTL    = 300   # 5 min
 NEWS_TTL    = 300
 
 
-def _fetch_quote(symbol):
-    """Fetch last-close price + daily change via Polygon daily aggregates.
-    Works for US equity ETFs (plain tickers) and crypto (X: prefix).
-    Uses last 2 trading bars so market-closed days show the correct last close."""
-    today     = date.today()
-    from_date = str(today - timedelta(days=10))
-    params    = {"sort": "asc", "limit": 10}
-    if not symbol.startswith("X:"):
-        params["adjusted"] = "true"
-    raw  = _poly_get(
-        f"{POLYGON_BASE}/v2/aggs/ticker/{symbol}/range/1/day/{from_date}/{today}",
-        params=params,
+def _to_yahoo_symbol(symbol):
+    """Convert Polygon-style X: prefix to Yahoo Finance symbol (used by chart API)."""
+    if symbol.startswith("X:"):
+        base = symbol[2:]
+        return base[:-3] + "-" + base[-3:]
+    return symbol
+
+
+# ── Polygon symbol routing ────────────────────────────────────────────────────────
+# Yahoo Finance → Polygon index ticker (v3/snapshot)
+_POLY_INDICES = {
+    "^DJI":  "I:DJI",
+    "^GSPC": "I:SPX",
+    "^IXIC": "I:COMP",
+    "^RUT":  "I:RUT2000",
+    "^VIX":  "I:VIX",
+    "^TNX":  "I:TNX",
+}
+# Yahoo Finance → Polygon crypto ticker (v2/snapshot/crypto)
+_POLY_CRYPTO = {
+    "BTC-USD": "X:BTCUSD",
+    "ETH-USD": "X:ETHUSD",
+}
+# Commodity futures — Polygon free tier does not carry futures; always use Yahoo
+_COMMODITY_FUTURES = {"GC=F", "SI=F", "PL=F", "CL=F", "BZ=F", "NG=F", "HG=F"}
+
+
+def _yahoo_chart_quote(sym):
+    """Single quote via Yahoo Finance v8/chart — reliable fallback.
+    Change = current price − today's open price."""
+    r = _session().get(
+        YAHOO_CHART_URL.format(symbol=sym),
+        params={"interval": "1d", "range": "5d"},
+        timeout=10,
     )
-    bars  = [b for b in (raw.get("results") or []) if b.get("c") is not None]
-    if not bars:
-        return 0.0, 0.0, 0.0
-    price = float(bars[-1]["c"])
-    prev  = float(bars[-2]["c"]) if len(bars) >= 2 else price
-    chg   = price - prev
-    pct   = (chg / prev * 100) if prev else 0.0
-    return round(price, 4), round(chg, 4), round(pct, 3)
+    r.raise_for_status()
+    result = r.json()["chart"]["result"][0]
+    meta   = result["meta"]
+    quote  = result["indicators"]["quote"][0]
+    closes = [c for c in quote.get("close", []) if c is not None]
+    opens  = [o for o in quote.get("open",  []) if o is not None]
+    price  = float(meta.get("regularMarketPrice") or (closes[-1] if closes else 0))
+    open_p = float(meta.get("regularMarketOpen")  or (opens[-1]  if opens  else 0))
+    chg, pct = _calc_chg(price, open_p)
+    return round(price, 4), chg, pct
+
+
+def _fetch_yahoo_quotes(yf_symbols):
+    """Yahoo Finance quotes.
+    Layer 1 — v7/quote batch (fast, single request).
+    Layer 2 — v8/chart per-symbol for anything Layer 1 missed or returned 0 for."""
+    if not yf_symbols:
+        return {}
+    out = {}
+    # Layer 1: v7/quote batch
+    try:
+        r = _session().get(
+            YAHOO_QUOTE_URL,
+            params={
+                "symbols": ",".join(yf_symbols),
+                "fields":  "regularMarketPrice,regularMarketOpen,"
+                           "regularMarketChange,regularMarketChangePercent",
+            },
+            timeout=15,
+        )
+        if r.status_code == 200:
+            for q in r.json().get("quoteResponse", {}).get("result", []):
+                sym   = q.get("symbol", "")
+                price  = float(q.get("regularMarketPrice") or 0)
+                open_p = float(q.get("regularMarketOpen") or 0)
+                chg, pct = _calc_chg(price, open_p)
+                if price > 0:
+                    out[sym] = (round(price, 4), chg, pct)
+    except Exception:
+        pass
+    # Layer 2: v8/chart for anything still missing
+    missing = [s for s in yf_symbols if s not in out or out[s][0] == 0]
+    if missing:
+        with ThreadPoolExecutor(max_workers=len(missing)) as pool:
+            futs = {pool.submit(_yahoo_chart_quote, s): s for s in missing}
+            for fut in as_completed(futs):
+                sym = futs[fut]
+                try:
+                    price, chg, pct = fut.result()
+                    if price > 0:
+                        out[sym] = (price, chg, pct)
+                except Exception:
+                    pass
+    return out
+
+
+def _calc_chg(price, open_price):
+    """Compute change and pct as: current price − today's open price."""
+    chg = price - open_price if open_price else 0.0
+    pct = (chg / open_price * 100) if open_price else 0.0
+    return round(chg, 4), round(pct, 3)
+
+
+def _fetch_polygon_indices(poly_tickers):
+    """Polygon v3/snapshot for indices.  Returns {poly_ticker: (price, chg, pct)}."""
+    if not poly_tickers:
+        return {}
+    data = _poly_get(
+        f"{POLYGON_BASE}/v3/snapshot",
+        params={"ticker.any_of": ",".join(poly_tickers)},
+    )
+    out = {}
+    for item in data.get("results", []):
+        sym     = item.get("ticker", "")
+        session = item.get("session") or {}
+        price   = float(session.get("price") or item.get("value") or 0)
+        open_p  = float(session.get("open") or 0)
+        chg, pct = _calc_chg(price, open_p)
+        out[sym] = (round(price, 4), chg, pct)
+    return out
+
+
+def _fetch_polygon_stocks(tickers):
+    """Polygon v2/snapshot for US stocks/ETFs. Returns {ticker: (price, chg, pct)}."""
+    if not tickers:
+        return {}
+    data = _poly_get(
+        f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers",
+        params={"tickers": ",".join(tickers)},
+    )
+    out = {}
+    for t in data.get("tickers", []):
+        sym   = t.get("ticker", "")
+        price = float((t.get("lastTrade") or {}).get("p") or
+                      (t.get("day") or {}).get("c") or 0)
+        open_p = float((t.get("day") or {}).get("o") or 0)
+        chg, pct = _calc_chg(price, open_p)
+        out[sym] = (round(price, 4), chg, pct)
+    return out
+
+
+def _fetch_polygon_crypto(poly_tickers):
+    """Polygon v2/snapshot for crypto. Returns {poly_ticker: (price, chg, pct)}."""
+    if not poly_tickers:
+        return {}
+    data = _poly_get(
+        f"{POLYGON_BASE}/v2/snapshot/locale/global/markets/crypto/tickers",
+        params={"tickers": ",".join(poly_tickers)},
+    )
+    out = {}
+    for t in data.get("tickers", []):
+        sym   = t.get("ticker", "")
+        price = float((t.get("lastTrade") or {}).get("p") or
+                      (t.get("day") or {}).get("c") or 0)
+        open_p = float((t.get("day") or {}).get("o") or 0)
+        chg, pct = _calc_chg(price, open_p)
+        out[sym] = (round(price, 4), chg, pct)
+    return out
+
+
+def _fetch_quotes_live(yf_symbols):
+    """Market-open: Polygon for indices/stocks/crypto; Yahoo for commodity futures.
+    Routes each symbol to the correct Polygon endpoint, falls back to Yahoo on error.
+    Returns {yf_symbol: (price, chg, pct)}."""
+    index_yf   = [s for s in yf_symbols if s in _POLY_INDICES]
+    crypto_yf  = [s for s in yf_symbols if s in _POLY_CRYPTO]
+    commodity  = [s for s in yf_symbols if s in _COMMODITY_FUTURES]
+    stock_yf   = [s for s in yf_symbols
+                  if s not in _POLY_INDICES and s not in _POLY_CRYPTO
+                  and s not in _COMMODITY_FUTURES]
+
+    out        = {}
+    yf_fallback = list(commodity)   # commodities always via Yahoo
+
+    # — Indices (Polygon v3) —
+    if index_yf:
+        try:
+            poly_map  = {_POLY_INDICES[s]: s for s in index_yf}  # poly→yf
+            poly_data = _fetch_polygon_indices(list(poly_map.keys()))
+            for poly_sym, vals in poly_data.items():
+                out[poly_map[poly_sym]] = vals
+            # Any index Polygon didn't return → Yahoo fallback
+            yf_fallback += [s for s in index_yf if s not in out]
+        except Exception:
+            yf_fallback += index_yf
+
+    # — US stocks / ETFs (Polygon v2) —
+    if stock_yf:
+        try:
+            poly_data = _fetch_polygon_stocks(stock_yf)
+            out.update(poly_data)
+            yf_fallback += [s for s in stock_yf if s not in out]
+        except Exception:
+            yf_fallback += stock_yf
+
+    # — Crypto (Polygon v2) —
+    if crypto_yf:
+        try:
+            poly_map  = {_POLY_CRYPTO[s]: s for s in crypto_yf}
+            poly_data = _fetch_polygon_crypto(list(poly_map.keys()))
+            for poly_sym, vals in poly_data.items():
+                out[poly_map[poly_sym]] = vals
+            yf_fallback += [s for s in crypto_yf if s not in out]
+        except Exception:
+            yf_fallback += crypto_yf
+
+    # — Yahoo fallback (commodities + any Polygon misses) —
+    if yf_fallback:
+        try:
+            out.update(_fetch_yahoo_quotes(yf_fallback))
+        except Exception:
+            pass
+
+    return out
+
+
+def _fetch_all_quotes(yf_symbols):
+    """Route to Polygon (market open) or Yahoo Finance (market closed)."""
+    if _market_open():
+        return _fetch_quotes_live(yf_symbols)
+    return _fetch_yahoo_quotes(yf_symbols)
 
 
 def _fetch_home_data():
+    idx_syms = [(sym, name) for sym, name in LAUNCHPAD_INDICES if sym is not None]
+    sec_syms = list(SECTORS)
+
+    all_yf = [sym for sym, _ in idx_syms] + [sym for sym, _ in sec_syms]
+    quotes  = _fetch_all_quotes(all_yf)
+
+    # Build fetched dict for indices / commodities / crypto
+    fetched = {}
+    for sym, name in idx_syms:
+        price, chg, pct = quotes.get(sym, (0, 0, 0))
+        fetched[sym] = {"symbol": sym, "name": name, "price": price, "chg": chg, "pct": pct}
+
+    # Build sectors list
     sectors = []
-    # Only fetch entries that have a real symbol (skip section headers where sym=None)
-    fetchable = [(sym, name) for sym, name in LAUNCHPAD_INDICES if sym is not None]
-    fetched   = {}
-    with ThreadPoolExecutor(max_workers=20) as pool:
-        idx_futs = {pool.submit(_fetch_quote, sym): (sym, name) for sym, name in fetchable}
-        sec_futs = {pool.submit(_fetch_quote, sym): (sym, name) for sym, name in SECTORS}
-        for fut, (sym, name) in idx_futs.items():
-            try:
-                price, chg, pct = fut.result()
-                fetched[sym] = {"symbol": sym, "name": name, "price": price, "chg": chg, "pct": pct}
-            except Exception:
-                fetched[sym] = {"symbol": sym, "name": name, "price": 0, "chg": 0, "pct": 0}
-        for fut, (sym, name) in sec_futs.items():
-            try:
-                price, chg, pct = fut.result()
-                sectors.append({"symbol": sym, "name": name, "price": price, "chg": chg, "pct": pct})
-            except Exception:
-                sectors.append({"symbol": sym, "name": name, "price": 0, "chg": 0, "pct": 0})
+    for sym, name in sec_syms:
+        price, chg, pct = quotes.get(sym, (0, 0, 0))
+        sectors.append({"symbol": sym, "name": name, "price": price, "chg": chg, "pct": pct})
+
     # Rebuild indices list in defined order, inserting section headers
     indices = []
     for sym, name in LAUNCHPAD_INDICES:
@@ -816,7 +1116,8 @@ def _fetch_home_data():
 
 def _get_home(force=False):
     now = time.time()
-    if force or now - _home_cache["fetched"] > HOME_TTL or not _home_cache["data"]:
+    ttl = 15 if _market_open() else HOME_TTL   # 15 s live refresh during session (4×/min)
+    if force or now - _home_cache["fetched"] > ttl or not _home_cache["data"]:
         try:
             _home_cache["data"]   = _fetch_home_data()
             _home_cache["fetched"] = now
@@ -825,24 +1126,43 @@ def _get_home(force=False):
     return _home_cache["data"]
 
 
-def _fetch_news():
+def _fetch_news(limit=50):
     r = requests.get(
         f"{POLYGON_BASE}/v2/reference/news",
-        params={"apiKey": POLYGON_API_KEY, "limit": 25, "order": "desc", "sort": "published_utc"},
+        params={"apiKey": POLYGON_API_KEY, "limit": limit,
+                "order": "desc", "sort": "published_utc"},
         headers=HEADERS, timeout=10,
     )
     r.raise_for_status()
     news = []
     for item in r.json().get("results", []):
-        title = (item.get("title") or "")[:110]
+        title = (item.get("title") or "")[:140]
         link  = item.get("article_url") or "#"
         raw   = item.get("published_utc", "")
+        # Publisher name
+        pub_obj   = item.get("publisher") or {}
+        publisher = (pub_obj.get("name") or pub_obj.get("homepage_url") or "")[:40]
+        # Tickers list — up to 6 shown
+        tickers = [t.strip().upper() for t in (item.get("tickers") or []) if t][:6]
+        # Description snippet
+        desc = (item.get("description") or "")[:200]
         try:
-            ts = datetime.strptime(raw[:19], "%Y-%m-%dT%H:%M:%S").strftime("%H:%M")
+            dt = datetime.strptime(raw[:19], "%Y-%m-%dT%H:%M:%S")
+            ts   = dt.strftime("%H:%M")
+            date = dt.strftime("%b %d")
         except Exception:
-            ts = raw[11:16] if len(raw) >= 16 else ""
+            ts   = raw[11:16] if len(raw) >= 16 else ""
+            date = raw[:10]
         if title:
-            news.append({"title": title, "link": link, "time": ts})
+            news.append({
+                "title":     title,
+                "link":      link,
+                "time":      ts,
+                "date":      date,
+                "publisher": publisher,
+                "tickers":   tickers,
+                "desc":      desc,
+            })
     return news
 
 
@@ -920,9 +1240,9 @@ async def api_refresh():
 
 
 @app.get("/api/chart/{symbol}")
-async def api_chart(symbol: str):
+async def api_chart(symbol: str, tf: str = "1y"):
     try:
-        data = _compute_chart_data(symbol.upper())
+        data = _compute_chart_data(symbol.upper(), tf)
         if data is None:
             return _json({"error": "Not enough data"})
         return _json(data)
@@ -1024,6 +1344,62 @@ async def api_home():
     return _json(d)
 
 
+@app.get("/api/debug/quotes")
+async def api_debug_quotes():
+    """Diagnostic endpoint — shows raw quote results from each source."""
+    syms = [s for s, _ in LAUNCHPAD_INDICES if s is not None]
+    result = {
+        "market_open":  _market_open(),
+        "et_time":      _et_now().strftime("%H:%M ET %a"),
+        "yahoo_v7":     {},
+        "yahoo_v8":     {},
+        "polygon_indices": {},
+        "polygon_stocks":  {},
+        "polygon_crypto":  {},
+    }
+    # Yahoo v7
+    try:
+        r = _session().get(YAHOO_QUOTE_URL,
+            params={"symbols": ",".join(syms),
+                    "fields": "regularMarketPrice,regularMarketChange,regularMarketChangePercent,regularMarketPreviousClose"},
+            timeout=15)
+        result["yahoo_v7"] = {"status": r.status_code, "data": r.json()}
+    except Exception as e:
+        result["yahoo_v7"] = {"error": str(e)}
+    # Yahoo v8/chart for DOW
+    try:
+        r = _session().get(YAHOO_CHART_URL.format(symbol="^DJI"),
+            params={"interval": "1d", "range": "5d"}, timeout=10)
+        meta = r.json()["chart"]["result"][0]["meta"]
+        result["yahoo_v8"] = {"price": meta.get("regularMarketPrice"),
+                              "prev":  meta.get("chartPreviousClose"),
+                              "status": r.status_code}
+    except Exception as e:
+        result["yahoo_v8"] = {"error": str(e)}
+    # Polygon indices
+    try:
+        data = _poly_get(f"{POLYGON_BASE}/v3/snapshot",
+                         params={"ticker.any_of": "I:DJI,I:SPX,I:COMP"})
+        result["polygon_indices"] = data
+    except Exception as e:
+        result["polygon_indices"] = {"error": str(e)}
+    # Polygon stocks (sample)
+    try:
+        data = _poly_get(f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers",
+                         params={"tickers": "XLK,XLF"})
+        result["polygon_stocks"] = data
+    except Exception as e:
+        result["polygon_stocks"] = {"error": str(e)}
+    # Polygon crypto
+    try:
+        data = _poly_get(f"{POLYGON_BASE}/v2/snapshot/locale/global/markets/crypto/tickers",
+                         params={"tickers": "X:BTCUSD"})
+        result["polygon_crypto"] = data
+    except Exception as e:
+        result["polygon_crypto"] = {"error": str(e)}
+    return _json(result)
+
+
 # ── Sector range fetch ────────────────────────────────────────────────────────────
 def _sector_date_range(range_str):
     today = date.today()
@@ -1035,30 +1411,50 @@ def _sector_date_range(range_str):
     if range_str == "1y":  return str(today - timedelta(days=365)), str(today)
     return None, None  # 1d → use snapshot
 
+_YAHOO_RANGE_MAP = {
+    "1d": "5d", "1w": "1mo", "1m": "1mo",
+    "3m": "3mo", "6m": "6mo", "ytd": "ytd", "1y": "1y",
+}
+
+
+def _yahoo_closes(symbol, yahoo_range):
+    """Return list of close prices (float) sorted asc from Yahoo Finance."""
+    r = _session().get(
+        YAHOO_CHART_URL.format(symbol=_to_yahoo_symbol(symbol)),
+        params={"interval": "1d", "range": yahoo_range},
+        timeout=10,
+    )
+    r.raise_for_status()
+    result = r.json()["chart"]["result"][0]
+    raw    = result["indicators"]["quote"][0].get("close", [])
+    return [float(c) for c in raw if c is not None]
+
+
 def _fetch_sector_pct(symbol, range_str):
+    yahoo_range = _YAHOO_RANGE_MAP.get(range_str, "1mo")
+    closes = _yahoo_closes(symbol, yahoo_range)
+    if not closes:
+        return 0.0
     if range_str == "1d":
-        today = date.today()
-        raw   = _poly_get(
-            f"{POLYGON_BASE}/v2/aggs/ticker/{symbol}/range/1/day"
-            f"/{today - timedelta(days=10)}/{today}",
-            params={"adjusted": "true", "sort": "asc", "limit": 10},
-        )
-        bars  = [b["c"] for b in (raw.get("results") or []) if b.get("c") is not None]
-        price = bars[-1] if bars else 0.0
-        prev  = bars[-2] if len(bars) >= 2 else price
-        pct   = (price - prev) / prev * 100 if prev else 0.0
+        if len(closes) < 2:
+            return 0.0
+        prev, price = closes[-2], closes[-1]
     else:
-        from_date, to_date = _sector_date_range(range_str)
-        raw    = _poly_get(
-            f"{POLYGON_BASE}/v2/aggs/ticker/{symbol}/range/1/day/{from_date}/{to_date}",
-            params={"adjusted": "true", "sort": "asc", "limit": 500},
-        )
-        closes = [b["c"] for b in (raw.get("results") or []) if b.get("c") is not None]
-        pct    = (closes[-1] - closes[0]) / closes[0] * 100 if len(closes) >= 2 else 0.0
-    return round(pct, 3)
+        prev, price = closes[0], closes[-1]
+    return round((price - prev) / prev * 100 if prev else 0.0, 3)
 
 
 def _fetch_sectors_for_range(range_str):
+    if range_str == "1d":
+        # Route to Polygon (live) or Yahoo (closed) — same logic as Market Monitor
+        sector_syms = [sym for sym, _ in SECTORS]
+        quotes  = _fetch_all_quotes(sector_syms)
+        results = []
+        for sym, name in SECTORS:
+            _, _, pct = quotes.get(sym, (0, 0, 0))
+            results.append({"symbol": sym, "name": name, "pct": pct})
+        return results
+    # Historical ranges: use chart API (need period start vs end close)
     results = []
     with ThreadPoolExecutor(max_workers=11) as pool:
         futs = {pool.submit(_fetch_sector_pct, sym, range_str): (sym, name) for sym, name in SECTORS}
@@ -1185,6 +1581,7 @@ canvas{width:100%!important;height:100%!important}
   <div class="panel">
     <div class="panel-hdr">
       <span class="dot">&#9672;</span> MARKET MONITOR
+      <span id="mkt-status" style="margin-left:8px;font-size:12px;font-weight:bold;"></span>
       <span class="sub" id="mkt-updated"></span>
     </div>
     <div id="lp-market-banner" style="display:none;background:#1a0a00;border-bottom:1px solid #f0b429;color:#f0b429;font-size:11px;padding:3px 8px;letter-spacing:.5px;">
@@ -1241,6 +1638,7 @@ canvas{width:100%!important;height:100%!important}
 
 <script>
 let sectorChart = null;
+let _homeTimer  = null;
 
 function tick(){document.getElementById('clock').textContent=new Date().toTimeString().slice(0,8);}
 setInterval(tick,1000); tick();
@@ -1248,7 +1646,7 @@ setInterval(tick,1000); tick();
 function pctCls(v){return v>0?'pos':v<0?'neg':'flat';}
 function sign(v){return v>0?'+':'';}
 function fmtPrice(v,sym){
-  if(sym==='X:BTCUSD'||v>10000) return v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  if(sym==='BTC-USD'||v>10000) return v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
   if(v<1) return v.toFixed(4);
   return v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
 }
@@ -1263,16 +1661,24 @@ async function loadHome(){
     const ts='Updated '+new Date().toTimeString().slice(0,8);
     document.getElementById('mkt-updated').textContent=ts;
     document.getElementById('sec-updated').textContent=ts;
-    // Market closed banner
+    // Market status indicator + closed banner
     const banner=document.getElementById('lp-market-banner');
     const bannerTime=document.getElementById('lp-banner-time');
+    const statusEl=document.getElementById('mkt-status');
     if(d.market_open===false){
       banner.style.display='block';
       bannerTime.textContent=d.et_time||'';
+      statusEl.textContent='\u25a0 CLOSED';
+      statusEl.style.color='#f0b429';
     } else {
       banner.style.display='none';
+      statusEl.textContent='\u25cf LIVE';
+      statusEl.style.color='var(--green)';
     }
-  }catch(e){console.error(e);}
+    // Schedule next refresh: 30 s when market is open, 5 min when closed
+    if(_homeTimer) clearTimeout(_homeTimer);
+    _homeTimer=setTimeout(loadHome, d.market_open ? 15000 : 300000);
+  }catch(e){console.error(e); if(_homeTimer) clearTimeout(_homeTimer); _homeTimer=setTimeout(loadHome,60000);}
 }
 
 async function loadNews(){
@@ -1413,11 +1819,10 @@ function renderNews(items){
   </div>`;
 }
 
-// Initial load
+// Initial load — home schedules its own next refresh dynamically
 loadHome();
 loadNews();
-// Refresh every 5 minutes
-setInterval(loadHome, 300000);
+// News refresh every 5 minutes (static — no live feed needed)
 setInterval(loadNews, 300000);
 </script>
 </body>
@@ -1803,6 +2208,11 @@ hr{border:none;border-top:1px solid var(--border);margin:4px 0;flex-shrink:0}
 .clbl{position:absolute;top:5px;left:9px;font-size:10px;color:var(--muted);z-index:5;pointer-events:none;letter-spacing:.4px}
 #loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
   background:var(--bg);color:var(--amber);font-size:14px;z-index:100}
+.tf-bar{display:flex;gap:4px;margin:4px 0;flex-shrink:0}
+.tf-btn{background:none;border:1px solid var(--muted);color:var(--muted);padding:2px 9px;
+  cursor:pointer;font-family:inherit;font-size:11px;letter-spacing:.5px}
+.tf-btn:hover{border-color:var(--amber);color:var(--amber)}
+.tf-btn.active{border-color:var(--abright);color:var(--abright);background:#1a1200}
 </style>
 </head>
 <body>
@@ -1821,8 +2231,18 @@ hr{border:none;border-top:1px solid var(--border);margin:4px 0;flex-shrink:0}
   <div><div class="stat-lbl">CROSSOVER</div><div class="stat-val" id="s-cross"></div></div>
 </div>
 <hr>
+<div class="tf-bar">
+  <button class="tf-btn" data-tf="1d">1D</button>
+  <button class="tf-btn" data-tf="1w">1W</button>
+  <button class="tf-btn" data-tf="1m">1M</button>
+  <button class="tf-btn" data-tf="3m">3M</button>
+  <button class="tf-btn" data-tf="6m">6M</button>
+  <button class="tf-btn" data-tf="ytd">YTD</button>
+  <button class="tf-btn active" data-tf="1y">1Y</button>
+  <button class="tf-btn" data-tf="max">MAX</button>
+</div>
 <div class="charts">
-  <div class="cpanel" id="pw"><span class="clbl">CANDLESTICK &nbsp;&#x2500;&nbsp; EMA 20 &nbsp;&#x2500;&nbsp; EMA 50 &nbsp;&#x2500;&nbsp; VOLUME</span><div id="pc" style="height:100%"></div></div>
+  <div class="cpanel" id="pw"><span class="clbl">CANDLESTICK &nbsp;&#x2500;&nbsp; <span style="color:#f0b429">EMA 9</span> &nbsp;&#x2500;&nbsp; <span style="color:#00d4ff">EMA 20</span> &nbsp;&#x2500;&nbsp; <span style="color:#ff6b6b">EMA 200</span> &nbsp;&#x2500;&nbsp; VOLUME</span><div id="pc" style="height:100%"></div></div>
   <div class="cpanel" id="mw"><span class="clbl">MACD &nbsp;&#x2500;&nbsp; SIGNAL &nbsp;&#x2500;&nbsp; HISTOGRAM</span><div id="mc" style="height:100%"></div></div>
   <div class="cpanel" id="rw"><span class="clbl">RSI (14)</span><div id="rc" style="height:100%"></div></div>
 </div>
@@ -1877,10 +2297,29 @@ function syncXH(pairs){
   });
 }
 
-async function load(){
-  const r = await fetch('/api/chart/'+SYM);
+let _activeCharts = [];
+let _ro = null;
+
+async function load(tf){
+  tf = tf || '1y';
+
+  // Mark active button
+  document.querySelectorAll('.tf-btn').forEach(b=>b.classList.toggle('active', b.dataset.tf===tf));
+
+  // Show loading overlay
+  const loadEl = document.getElementById('loading');
+  loadEl.textContent = 'Loading\u2026';
+  loadEl.style.display = 'flex';
+
+  // Destroy old charts
+  _activeCharts.forEach(c=>{ try{c.remove();}catch(e){} });
+  _activeCharts = [];
+  if(_ro){ _ro.disconnect(); _ro = null; }
+  ['pc','mc','rc'].forEach(id=>{ document.getElementById(id).innerHTML=''; });
+
+  const r = await fetch('/api/chart/'+SYM+'?tf='+tf);
   const d = await r.json();
-  if(d.error){ document.getElementById('loading').textContent='Error: '+d.error; return; }
+  if(d.error){ loadEl.textContent='Error: '+d.error; return; }
 
   // Header
   document.getElementById('sym').textContent   = d.symbol;
@@ -1917,21 +2356,25 @@ async function load(){
   pc.priceScale('vol').applyOptions({scaleMargins:{top:0.82,bottom:0}});
   vol.setData(d.volumes);
 
-  const e20 = pc.addLineSeries({color:CLR.cyan,   lineWidth:1.4,priceLineVisible:false,lastValueVisible:false});
-  const e50 = pc.addLineSeries({color:CLR.abright,lineWidth:1.4,priceLineVisible:false,lastValueVisible:false,
-                                 lineStyle:LightweightCharts.LineStyle.Dashed});
+  const e9  = pc.addLineSeries({color:'#f0b429',lineWidth:1.2,priceLineVisible:false,lastValueVisible:true,title:'EMA9'});
+  const e20 = pc.addLineSeries({color:'#00d4ff',lineWidth:1.4,priceLineVisible:false,lastValueVisible:true,title:'EMA20'});
+  e9.setData(d.ema9);
   e20.setData(d.ema20);
-  e50.setData(d.ema50);
+  if(d.ema200 && d.ema200.length){
+    const e200 = pc.addLineSeries({color:'#ff6b6b',lineWidth:1.6,priceLineVisible:false,lastValueVisible:true,title:'EMA200',
+                                    lineStyle:LightweightCharts.LineStyle.Dashed});
+    e200.setData(d.ema200);
+  }
 
   // ── MACD chart ──────────────────────────────────────────────────────────────
   const mcEl = document.getElementById('mc');
   const mc   = mkChart(mcEl);
 
-  const hist    = mc.addHistogramSeries({priceLineVisible:false,lastValueVisible:false});
-  const macdLn  = mc.addLineSeries({color:CLR.cyan,   lineWidth:1.5,priceLineVisible:false,lastValueVisible:true});
-  const sigLn   = mc.addLineSeries({color:CLR.abright,lineWidth:1.2,priceLineVisible:false,lastValueVisible:true,
-                                     lineStyle:LightweightCharts.LineStyle.Dashed});
-  hist.setData(d.hist);
+  const histSeries = mc.addHistogramSeries({priceLineVisible:false,lastValueVisible:false});
+  const macdLn     = mc.addLineSeries({color:CLR.cyan,   lineWidth:1.5,priceLineVisible:false,lastValueVisible:true});
+  const sigLn      = mc.addLineSeries({color:CLR.abright,lineWidth:1.2,priceLineVisible:false,lastValueVisible:true,
+                                       lineStyle:LightweightCharts.LineStyle.Dashed});
+  histSeries.setData(d.hist);
   macdLn.setData(d.macd);
   sigLn.setData(d.signal);
 
@@ -1947,21 +2390,27 @@ async function load(){
   rc.priceScale('right').applyOptions({autoScale:false,minimum:0,maximum:100});
 
   // ── Sync + fit ───────────────────────────────────────────────────────────────
-  syncTS([pc, mc, rc]);
+  _activeCharts = [pc, mc, rc];
+  syncTS(_activeCharts);
   syncXH([[pc,candles],[mc,macdLn],[rc,rsiLn]]);
-  [pc,mc,rc].forEach(c=>c.timeScale().fitContent());
+  _activeCharts.forEach(c=>c.timeScale().fitContent());
 
   // ── Resize ───────────────────────────────────────────────────────────────────
-  new ResizeObserver(()=>{
+  _ro = new ResizeObserver(()=>{
     pc.resize(pcEl.clientWidth, pcEl.clientHeight);
     mc.resize(mcEl.clientWidth, mcEl.clientHeight);
     rc.resize(rcEl.clientWidth, rcEl.clientHeight);
-  }).observe(document.getElementById('pw'));
+  });
+  _ro.observe(document.getElementById('pw'));
 
-  document.getElementById('loading').style.display='none';
+  loadEl.style.display = 'none';
 }
 
-load();
+document.querySelectorAll('.tf-btn').forEach(b=>{
+  b.addEventListener('click', ()=>load(b.dataset.tf));
+});
+
+load('1y');
 </script>
 </body>
 </html>"""
